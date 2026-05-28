@@ -211,16 +211,17 @@ async def get_threat_overview() -> dict:
         edge_rows = (await session.execute(text("""
             SELECT
               e.id AS edge_id, e.domain, e.state, e.protection_mode,
-              e.last_heartbeat, e.tenant_id,
+              e.last_seen_at AS last_heartbeat, e.tenant_id,
               COUNT(DISTINCT t.ip)  AS threat_ips,
               SUM(t.report_count)   AS events,
               MAX(t.threat_score)   AS max_score
             FROM edge_nodes e
             LEFT JOIN threat_reports t ON t.edge_id = e.id
-            GROUP BY e.id, e.domain, e.state, e.protection_mode, e.last_heartbeat, e.tenant_id
-            -- MariaDB doesn't support `NULLS LAST`; emulate it by sorting
-            -- null rows after non-null rows, then by events DESC within each.
-            ORDER BY events IS NULL, events DESC
+            GROUP BY e.id, e.domain, e.state, e.protection_mode, e.last_seen_at, e.tenant_id
+            -- MariaDB sorts NULLs as lowest values, so DESC already places
+            -- rows with no events at the end. PostgreSQL needs an explicit
+            -- `NULLS LAST` but MariaDB rejects that syntax.
+            ORDER BY events DESC
         """))).all()
 
     def fmt_dt(v):
