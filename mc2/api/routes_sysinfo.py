@@ -36,6 +36,42 @@ SERVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9._@:-]+$")
 ALLOWED_SERVICE_ACTIONS = {"start", "stop", "restart", "enable", "disable", "reload"}
 ALLOWED_KILL_SIGNALS = {1, 9, 15}  # SIGHUP, SIGKILL, SIGTERM
 
+# Kernel pseudo-filesystems — they have no real "disk usage" (psutil reports
+# 0/0 or the wrapping FS's stats). Listing them as rows with numeric used/total
+# values implies they consume storage, which is misleading and produces
+# duplicate-looking "Disk Usage" amounts across many rows. Mark these so the
+# UI can render usage as "—" instead of a fake number.
+_VIRTUAL_FSTYPES: frozenset[str] = frozenset({
+    "sysfs", "proc", "devpts", "devtmpfs", "cgroup", "cgroup2", "configfs",
+    "securityfs", "bpf", "debugfs", "tracefs", "fusectl", "autofs", "pstore",
+    "efivarfs", "hugetlbfs", "mqueue", "binfmt_misc", "ramfs", "rpc_pipefs",
+    "nsfs", "selinuxfs", "fuse.gvfsd-fuse", "fuse.portal",
+})
+
+
+def _classify_mount(part: psutil._common.sdiskpart) -> tuple[bool, dict | None]:
+    """
+    Compute (is_virtual, usage_dict_or_None) for a psutil partition.
+
+    - is_virtual: True if fstype is a kernel pseudo-FS — caller should suppress
+      numeric usage display for these.
+    - usage_dict: psutil.disk_usage(mountpoint) result rounded to GB, or None
+      if the lookup failed (permission denied) or is_virtual is True.
+    """
+    is_virtual = part.fstype in _VIRTUAL_FSTYPES
+    if is_virtual:
+        return True, None
+    try:
+        u = psutil.disk_usage(part.mountpoint)
+    except (PermissionError, OSError):
+        return False, None
+    return False, {
+        "total_gb": round(u.total / 1e9, 2),
+        "used_gb":  round(u.used  / 1e9, 2),
+        "free_gb":  round(u.free  / 1e9, 2),
+        "percent":  u.percent,
+    }
+
 LOG_FILES = [
     "/var/log/syslog",
     "/var/log/auth.log",
@@ -364,19 +400,24 @@ async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
     disks = []
+    # Dedupe bind mounts by underlying device: only emit the primary mount per
+    # device so the UI doesn't show the same used/total numbers across multiple
+    # rows for the same physical filesystem.
+    seen_devices: set[str] = set()
     for part in psutil.disk_partitions(all=False):
-        try:
-            usage = psutil.disk_usage(part.mountpoint)
-        except PermissionError:
+        is_virtual, usage = _classify_mount(part)
+        if is_virtual or usage is None:
             continue
+        if part.device in seen_devices:
+            # Bind mount / alias of an already-emitted device — skip on dashboard
+            # to keep the card focused on distinct filesystems.
+            continue
+        seen_devices.add(part.device)
         disks.append({
             "mountpoint": part.mountpoint,
-            "device": part.device,
-            "fstype": part.fstype,
-            "total_gb": round(usage.total / 1e9, 2),
-            "used_gb": round(usage.used / 1e9, 2),
-            "free_gb": round(usage.free / 1e9, 2),
-            "percent": usage.percent,
+            "device":     part.device,
+            "fstype":     part.fstype,
+            **usage,
         })
     net = psutil.net_io_counters()
     net_per_nic = psutil.net_io_counters(pernic=True)
@@ -1131,14 +1172,41 @@ async def delete_group(name: str, _: str = Depends(require_super_admin)) -> dict
 
 @router.get("/filesystems")
 async def get_filesystems(_: str = Depends(require_super_admin)) -> dict:
-    mounts = []
+    """
+    List every mount on the host. Each mount is classified so the UI can
+    decide whether numeric usage is meaningful:
+
+      - is_virtual=True  → kernel pseudo-FS (proc, sysfs, cgroup, …).
+        used/total/free/percent are all None — UI should render "—".
+
+      - alias_of=<path>  → bind mount or duplicate mount of an already-listed
+        underlying device. used/total/free/percent ARE included (psutil
+        returns the wrapping FS stats), but the UI should de-emphasize them
+        as a reminder that they share storage with the primary mount.
+
+      - is_virtual=False, alias_of=None → distinct real filesystem; show
+        normal df-style usage.
+    """
+    mounts: list[dict] = []
+    primary_for_device: dict[str, str] = {}  # device → first mountpoint seen
     for part in psutil.disk_partitions(all=True):
-        try:
-            usage = psutil.disk_usage(part.mountpoint)
-            used_gb, total_gb, free_gb, percent = round(usage.used / 1e9, 2), round(usage.total / 1e9, 2), round(usage.free / 1e9, 2), usage.percent
-        except (PermissionError, OSError):
-            used_gb = total_gb = free_gb = percent = None
-        mounts.append({"device": part.device, "mountpoint": part.mountpoint, "fstype": part.fstype, "opts": part.opts, "total_gb": total_gb, "used_gb": used_gb, "free_gb": free_gb, "percent": percent})
+        is_virtual, usage = _classify_mount(part)
+        alias_of = primary_for_device.get(part.device) if not is_virtual else None
+        if not is_virtual and alias_of is None:
+            primary_for_device[part.device] = part.mountpoint
+        row = {
+            "device":     part.device,
+            "mountpoint": part.mountpoint,
+            "fstype":     part.fstype,
+            "opts":       part.opts,
+            "is_virtual": is_virtual,
+            "alias_of":   alias_of,
+            "total_gb":   (usage or {}).get("total_gb"),
+            "used_gb":    (usage or {}).get("used_gb"),
+            "free_gb":    (usage or {}).get("free_gb"),
+            "percent":    (usage or {}).get("percent"),
+        }
+        mounts.append(row)
     return {"mounts": mounts, "count": len(mounts), "checked_at": datetime.now(UTC).isoformat()}
 
 

@@ -1,3 +1,3 @@
 """OrbWeaver MC² — standalone command authority."""
 
-__version__ = "1.33.2"
+__version__ = "1.33.3"
