@@ -48,6 +48,14 @@ _VIRTUAL_FSTYPES: frozenset[str] = frozenset({
     "nsfs", "selinuxfs", "fuse.gvfsd-fuse", "fuse.portal",
 })
 
+# In-memory ephemeral filesystems — they have real (if small) usage but they're
+# not persistent storage, so the ServOps Dashboard Disk card hides them. The
+# Filesystems page keeps them visible (they're real mounts the operator may
+# want to inspect).
+_DASHBOARD_HIDDEN_FSTYPES: frozenset[str] = _VIRTUAL_FSTYPES | frozenset({
+    "tmpfs",
+})
+
 
 def _classify_mount(part: psutil._common.sdiskpart) -> tuple[bool, dict | None]:
     """
@@ -400,11 +408,15 @@ async def get_sysinfo(_: str = Depends(require_super_admin)) -> dict:
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
     disks = []
-    # Dedupe bind mounts by underlying device: only emit the primary mount per
-    # device so the UI doesn't show the same used/total numbers across multiple
-    # rows for the same physical filesystem.
+    # Iterate ALL mounts (all=True) so FUSE-backed object storage (s3fs/rclone)
+    # and network mounts (nfs/cifs) show up — psutil.disk_partitions(all=False)
+    # filters them out because they're not kernel block devices. Hide kernel
+    # pseudo-FSes and ephemeral tmpfs via _DASHBOARD_HIDDEN_FSTYPES, and dedupe
+    # bind mounts by underlying device so the same storage doesn't repeat.
     seen_devices: set[str] = set()
-    for part in psutil.disk_partitions(all=False):
+    for part in psutil.disk_partitions(all=True):
+        if part.fstype in _DASHBOARD_HIDDEN_FSTYPES:
+            continue
         is_virtual, usage = _classify_mount(part)
         if is_virtual or usage is None:
             continue
