@@ -218,7 +218,9 @@ async def get_threat_overview() -> dict:
             FROM edge_nodes e
             LEFT JOIN threat_reports t ON t.edge_id = e.id
             GROUP BY e.id, e.domain, e.state, e.protection_mode, e.last_heartbeat, e.tenant_id
-            ORDER BY events DESC NULLS LAST
+            -- MariaDB doesn't support `NULLS LAST`; emulate it by sorting
+            -- null rows after non-null rows, then by events DESC within each.
+            ORDER BY events IS NULL, events DESC
         """))).all()
 
     def fmt_dt(v):
