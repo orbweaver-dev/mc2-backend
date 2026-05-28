@@ -570,23 +570,37 @@ async def get_active_blocks(
     _: TokenPayload = Depends(require_security_analyst),
 ):
     """
-    Return the full Defense Mesh blocklist surface — the union of every IP the
-    mesh would deny on contact:
+    Report every layer the Defense Mesh uses to block (or observe) IPs, with
+    each layer counted separately so the dashboard can show the breakdown:
 
-      - nft `blacklist` (IPv4) + `blacklist6` (IPv6) on this host
-      - nft `temp_ban` (short-term dynamic bans)
-      - `frothiq_ip_list` DB rows (canonical mirror of what should be in nft;
-        may include entries that drifted off nft after a restart)
-      - `threat_reports` community pool (IPs reported by any edge tenant)
+    Enforced layers — IPs the mesh actively denies on contact:
+      - `nft_v4_count` / `nft_v6_count` / `temp_ban_count` — kernel-level
+        firewall on this host (immediate drops at the network stack).
+      - `db_blacklist_count` — frothiq_ip_list canonical mirror; pushed into
+        nft on this host AND distributed via /edge/blocklist to every plugin.
+      - `community_distributed_count` — threat_reports rows above the
+        free-tier serving threshold (score ≥ 50, i.e. ≥2 tenants agreed).
+        These are served via /edge/blocklist and enforced inside every WP
+        plugin at the application layer.
 
-    Minus any operator whitelist entries.
+    Observed-only layer — IPs the mesh has seen but DOES NOT enforce:
+      - `community_observed_count` — threat_reports rows below the score
+        threshold (single-tenant reports). Kept for awareness; not pushed
+        to plugins. Becomes enforced if a second tenant corroborates and
+        score crosses 50.
 
-    Counts the union, deduplicated by IP — the same address present in multiple
-    sources counts once. Previous version returned only nft v4 + temp_ban,
-    underreporting by ~10x once the community pool had accumulated entries.
+    Aggregates:
+      - `total_blocked`  — unique IPs across all enforced layers, minus the
+        operator whitelist. This is the dashboard's "blocked" number.
+      - `total_observed` — total_blocked + community_observed; the mesh's
+        full IP awareness.
     """
     from sqlalchemy import text as _sql
     from mc2.integrations.database import get_session_factory
+
+    # Threshold has to track get_blocklist() in edge_service. Free tier
+    # currently matches enterprise (50) while plan enforcement is off.
+    COMMUNITY_SERVE_THRESHOLD = 50
 
     (bl_exact, bl_nets, temp_ban), bl6_raw, whitelist_v4, whitelist_v6 = await asyncio.gather(
         asyncio.to_thread(_build_block_sets),
@@ -601,9 +615,10 @@ async def get_active_blocks(
     temp_ban_set: set[str] = set(temp_ban)
     whitelist_set: set[str] = set(whitelist_v4) | set(whitelist_v6)
 
-    # Pull DB blacklist + community pool concurrently.
+    # DB + community pool, split by the actual serve threshold.
     db_bl_ips: set[str] = set()
-    community_ips: set[str] = set()
+    community_enforced: set[str] = set()
+    community_observed: set[str] = set()
     try:
         async with get_session_factory()() as session:
             db_rows = (await session.execute(_sql(
@@ -611,28 +626,48 @@ async def get_active_blocks(
             ))).all()
             db_bl_ips = {r[0] for r in db_rows}
 
-            community_rows = (await session.execute(_sql(
-                "SELECT DISTINCT ip FROM threat_reports"
+            comm_rows = (await session.execute(_sql(
+                "SELECT ip, MAX(threat_score) AS s FROM threat_reports GROUP BY ip"
             ))).all()
-            community_ips = {r[0] for r in community_rows}
+            for r in comm_rows:
+                if (r.s or 0) >= COMMUNITY_SERVE_THRESHOLD:
+                    community_enforced.add(r.ip)
+                else:
+                    community_observed.add(r.ip)
     except Exception as exc:
         logger.warning("get_active_blocks: DB read failed: %s", exc)
 
-    union: set[str] = nft_v4_exact | nft_v6 | temp_ban_set | db_bl_ips | community_ips
-    union -= whitelist_set
+    enforced_union: set[str] = (
+        nft_v4_exact | nft_v6 | temp_ban_set | db_bl_ips | community_enforced
+    ) - whitelist_set
+    observed_union: set[str] = enforced_union | (community_observed - whitelist_set)
 
     return {
+        # Per-layer counts so the UI can render the breakdown
+        "nft_v4_count":               len(nft_v4_exact) + len(nft_v4_nets),
+        "nft_v6_count":               len(nft_v6),
+        "temp_ban_count":             len(temp_ban_set),
+        "db_blacklist_count":         len(db_bl_ips),
+        "community_distributed_count": len(community_enforced),
+        "community_observed_count":   len(community_observed),
+
+        # Aggregate counts (deduplicated unions, whitelist excluded)
+        "total_blocked":   len(enforced_union),
+        "total_observed":  len(observed_union),
+
+        # Bare lists for the "Active Blocks" page that wants to render
+        # individual IPs (this is still nft-only — that page is the live
+        # firewall state, not the mesh-wide view).
         "blacklist":         sorted(nft_v4_exact | set(nft_v4_nets) | nft_v6),
         "blacklist_count":   len(nft_v4_exact) + len(nft_v4_nets) + len(nft_v6),
         "temp_ban":          sorted(temp_ban_set),
-        "temp_ban_count":    len(temp_ban_set),
-        "db_blacklist_count":  len(db_bl_ips),
-        "community_count":     len(community_ips),
-        # total_blocked = unique IPs across every blocklist source minus whitelist.
-        # This is what the dashboard "X blocked" tile should read against.
-        "total_blocked":     len(union),
+
+        # Whitelist for symmetry
         "whitelist":         sorted(whitelist_set),
         "whitelist_count":   len(whitelist_set),
+
+        # Echo the threshold so the UI can show "≥ N tenants confirmed"
+        "community_serve_threshold": COMMUNITY_SERVE_THRESHOLD,
     }
 
 
