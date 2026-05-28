@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import re
 import subprocess
 import time
@@ -20,6 +21,8 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Query, Request
 
 from mc2.auth import TokenPayload, require_security_analyst
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/traffic", tags=["traffic"])
 
@@ -567,22 +570,69 @@ async def get_active_blocks(
     _: TokenPayload = Depends(require_security_analyst),
 ):
     """
-    Return currently active nftables blocks: permanent blacklist + active temp bans.
-    Reads live nft sets — reflects real enforcement state.
+    Return the full Defense Mesh blocklist surface — the union of every IP the
+    mesh would deny on contact:
+
+      - nft `blacklist` (IPv4) + `blacklist6` (IPv6) on this host
+      - nft `temp_ban` (short-term dynamic bans)
+      - `frothiq_ip_list` DB rows (canonical mirror of what should be in nft;
+        may include entries that drifted off nft after a restart)
+      - `threat_reports` community pool (IPs reported by any edge tenant)
+
+    Minus any operator whitelist entries.
+
+    Counts the union, deduplicated by IP — the same address present in multiple
+    sources counts once. Previous version returned only nft v4 + temp_ban,
+    underreporting by ~10x once the community pool had accumulated entries.
     """
-    (bl_exact, bl_nets, temp_ban), whitelist_raw = await asyncio.gather(
+    from sqlalchemy import text as _sql
+    from mc2.integrations.database import get_session_factory
+
+    (bl_exact, bl_nets, temp_ban), bl6_raw, whitelist_v4, whitelist_v6 = await asyncio.gather(
         asyncio.to_thread(_build_block_sets),
+        asyncio.to_thread(lambda: _nft_list_set("blacklist6")),
         asyncio.to_thread(lambda: _nft_list_set("whitelist")),
+        asyncio.to_thread(lambda: _nft_list_set("whitelist6")),
     )
-    all_bl = list(bl_exact) + [str(n) for n in bl_nets]
+
+    nft_v4_exact: set[str] = set(bl_exact)
+    nft_v4_nets:  list[str] = [str(n) for n in bl_nets]
+    nft_v6:       set[str] = set(bl6_raw)
+    temp_ban_set: set[str] = set(temp_ban)
+    whitelist_set: set[str] = set(whitelist_v4) | set(whitelist_v6)
+
+    # Pull DB blacklist + community pool concurrently.
+    db_bl_ips: set[str] = set()
+    community_ips: set[str] = set()
+    try:
+        async with get_session_factory()() as session:
+            db_rows = (await session.execute(_sql(
+                "SELECT DISTINCT ip FROM frothiq_ip_list WHERE list_type='blacklist'"
+            ))).all()
+            db_bl_ips = {r[0] for r in db_rows}
+
+            community_rows = (await session.execute(_sql(
+                "SELECT DISTINCT ip FROM threat_reports"
+            ))).all()
+            community_ips = {r[0] for r in community_rows}
+    except Exception as exc:
+        logger.warning("get_active_blocks: DB read failed: %s", exc)
+
+    union: set[str] = nft_v4_exact | nft_v6 | temp_ban_set | db_bl_ips | community_ips
+    union -= whitelist_set
+
     return {
-        "blacklist": sorted(all_bl),
-        "blacklist_count": len(all_bl),
-        "temp_ban": sorted(temp_ban),
-        "temp_ban_count": len(temp_ban),
-        "total_blocked": len(all_bl) + len(temp_ban),
-        "whitelist": sorted(whitelist_raw),
-        "whitelist_count": len(whitelist_raw),
+        "blacklist":         sorted(nft_v4_exact | set(nft_v4_nets) | nft_v6),
+        "blacklist_count":   len(nft_v4_exact) + len(nft_v4_nets) + len(nft_v6),
+        "temp_ban":          sorted(temp_ban_set),
+        "temp_ban_count":    len(temp_ban_set),
+        "db_blacklist_count":  len(db_bl_ips),
+        "community_count":     len(community_ips),
+        # total_blocked = unique IPs across every blocklist source minus whitelist.
+        # This is what the dashboard "X blocked" tile should read against.
+        "total_blocked":     len(union),
+        "whitelist":         sorted(whitelist_set),
+        "whitelist_count":   len(whitelist_set),
     }
 
 
