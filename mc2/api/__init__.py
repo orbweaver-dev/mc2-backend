@@ -61,6 +61,7 @@ from .routes_proftpd import router as proftpd_router
 from .routes_domain_bandwidth import router as domain_bandwidth_router
 from .routes_awstats import router as awstats_router
 from .routes_themes import router as themes_router
+from .routes_vhost import router as vhost_router
 from .routes_universe import router as universe_router
 
 # All control center routes under /api/v1/cc/
@@ -172,7 +173,7 @@ api_router.include_router(domain_bandwidth_router)
 api_router.include_router(awstats_router)
 # Theme system — operator-editable CSS variable bundles, one active at a time
 api_router.include_router(themes_router)
-# Universe — OrbWeaver shared reference-data authority (datasets + per-consumer API keys)
+api_router.include_router(vhost_router)
 api_router.include_router(universe_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
