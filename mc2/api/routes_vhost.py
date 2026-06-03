@@ -51,26 +51,32 @@ def _check_username(name: str) -> str:
     return name
 
 
-def _features_for(d: state.DomainRecord) -> list[str]:
+def _cheap_features_for(d: state.DomainRecord) -> list[str]:
     """
-    Derive the feature flags the UI renders as chips.
+    Per-row feature chips for the vhost picker.
 
-    Every probe is wrapped so a single unreadable file (e.g. a BIND zone
-    in a directory MC² can't traverse) returns False for that feature
-    instead of 500ing the entire picker. The vhost picker is on the hot
-    path; it must stay resilient to any one source's quirks.
+    Only emits flags that are free from already-parsed Apache config —
+    `web` (any port) and `ssl` (port 443 / SSLEngine on). Mail / DNS /
+    MariaDB probes were each costing a sudo+CLI shellout per domain
+    (~1.5s × 30 domains × 3 sources ≈ 100s wall), turning the picker
+    back into a multi-second page. The per-domain dashboard runs the
+    expensive probes once when the operator drills in.
     """
     feats = []
-    try:
-        if d.has_http or d.has_https:
-            feats.append("web")
-    except Exception as exc:
-        logger.warning("features web check failed for %s: %s", d.domain, exc)
-    try:
-        if d.ssl_enabled:
-            feats.append("ssl")
-    except Exception as exc:
-        logger.warning("features ssl check failed for %s: %s", d.domain, exc)
+    if d.has_http or d.has_https:
+        feats.append("web")
+    if d.ssl_enabled:
+        feats.append("ssl")
+    return feats
+
+
+def _full_features_for(d: state.DomainRecord) -> list[str]:
+    """
+    Comprehensive feature list — used by the per-domain dashboard, never
+    by the picker. Each probe wrapped in try/except so a single
+    unreadable source can't 500 the request.
+    """
+    feats = _cheap_features_for(d)
     try:
         if state.list_postfix_aliases(d.domain) or _has_mailboxes(d.owner_user, d.domain):
             feats.append("mail")
@@ -112,7 +118,7 @@ def list_domains(_: Auth) -> dict:
         "plan":      "",
         "parent":    d.parent,
         "quota_mb":  None,
-        "features":  _features_for(d),
+        "features":  _cheap_features_for(d),
     } for d in rows]
     return {"domains": domains, "count": len(domains)}
 
@@ -138,7 +144,7 @@ def domain_info(_: Auth, domain: str) -> dict:
         "quota_mb":        None,
         "used_quota_mb":   None,
         "bandwidth_used_mb": None,
-        "features":        _features_for(d),
+        "features":        _full_features_for(d),
         "ssl_expiry":      "",
         "config_file":     d.config_file,
         "access_log":      d.access_log,
