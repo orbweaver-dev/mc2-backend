@@ -148,17 +148,43 @@ class DomainRecord:
 
 
 def _owner_of_path(path: str) -> tuple[str, int]:
-    """Stat a docroot and return (username, uid). Empty on failure."""
+    """
+    Resolve (username, uid) for a vhost's DocumentRoot.
+
+    Primary strategy: stat() the path and look up by st_uid. That fails
+    with EACCES when /home/<owner>/ is mode 0750 group-only (Virtualmin
+    default) — mc2 has no traverse rights into per-user homes.
+
+    Fallback strategy: walk /etc/passwd once and pick the user whose
+    home directory is a prefix of `path`. This needs zero privilege on
+    /home and works for the standard `/home/<owner>/<anything>` layout.
+    """
     if not path:
         return "", -1
     try:
         st = os.stat(path)
+        try:
+            return pwd.getpwuid(st.st_uid).pw_name, st.st_uid
+        except KeyError:
+            return "", st.st_uid
     except OSError:
-        return "", -1
-    try:
-        return pwd.getpwuid(st.st_uid).pw_name, st.st_uid
-    except KeyError:
-        return "", st.st_uid
+        pass
+
+    # EACCES (or path doesn't exist) — fall back to home-prefix match.
+    path = path.rstrip("/")
+    best_pw: pwd.struct_passwd | None = None
+    best_len = -1
+    for pw in pwd.getpwall():
+        home = (pw.pw_dir or "").rstrip("/")
+        if not home or home == "/":
+            continue
+        if path == home or path.startswith(home + "/"):
+            if len(home) > best_len:
+                best_pw = pw
+                best_len = len(home)
+    if best_pw is not None:
+        return best_pw.pw_name, best_pw.pw_uid
+    return "", -1
 
 
 def list_domains() -> list[DomainRecord]:

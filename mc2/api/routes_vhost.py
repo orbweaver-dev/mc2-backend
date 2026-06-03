@@ -114,7 +114,11 @@ def list_domains(_: Auth) -> dict:
         "ip":        d.ip,
         "ip6":       d.ip6,
         "home":      d.docroot,
-        "template":  "",
+        # "Template" used to be Virtualmin's deployment-template name (the
+        # preset a vhost was provisioned from). MC² doesn't have that
+        # concept; surface the source Apache config file instead so the
+        # operator can see which file to edit / which template generated it.
+        "template":  d.config_file,
         "plan":      "",
         "parent":    d.parent,
         "quota_mb":  None,
