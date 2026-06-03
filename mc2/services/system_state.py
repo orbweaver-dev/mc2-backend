@@ -335,17 +335,30 @@ def email_address_for(username: str, domain_owner: str, domain: str) -> str:
 # MariaDB databases
 # ---------------------------------------------------------------------------
 
-_MYSQL_CLI = "/usr/bin/mariadb"
-_SYSTEM_DBS = {"information_schema", "performance_schema", "mysql", "sys"}
+_MYSQL_CLI       = "/usr/bin/mariadb"
+_MYSQL_CREDS     = "/etc/mysql/debian.cnf"
+_SYSTEM_DBS      = {"information_schema", "performance_schema", "mysql", "sys"}
 
 
 def _mysql(cmd: str) -> str:
-    """Run a single SQL statement via the local socket; return raw text. Empty on failure."""
+    """
+    Run a single SQL statement via the local socket; return raw text. Empty
+    on failure.
+
+    The `root@localhost` MariaDB user isn't configured for unix_socket auth
+    on this host, so we authenticate via `/etc/mysql/debian.cnf` (the
+    debian-sys-maint-style credentials file shipped by the mariadb-server
+    package). It's root-readable only; sudo runs the client as root so it
+    can read it.
+    """
     if not Path(_MYSQL_CLI).exists():
         return ""
     try:
         r = subprocess.run(
-            ["sudo", _MYSQL_CLI, "--batch", "--skip-column-names", "-e", cmd],
+            ["sudo", _MYSQL_CLI,
+             f"--defaults-file={_MYSQL_CREDS}",
+             "--batch", "--skip-column-names",
+             "-e", cmd],
             capture_output=True, text=True, timeout=10,
         )
         if r.returncode != 0:
