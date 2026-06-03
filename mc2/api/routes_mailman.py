@@ -33,10 +33,9 @@ def _vmin(*args: str) -> tuple[int, str, str]:
 
 
 def _list_domains() -> list[str]:
-	rc, out, _err = _vmin("list-domains", "--name-only")
-	if rc != 0:
-		return []
-	return [d.strip() for d in out.splitlines() if d.strip()]
+	# Reads from Apache vhost files via system_state — no virtualmin shellout.
+	from mc2.services import system_state
+	return [d.domain for d in system_state.list_domains()]
 
 
 _SIZE_RE = re.compile(r"^([\d.]+)\s*([KMGT]?i?B)?$", re.I)

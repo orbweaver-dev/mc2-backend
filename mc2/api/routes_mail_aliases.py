@@ -1,84 +1,103 @@
 """
-Email Alias & Forwarding Manager — reads/writes Virtualmin mail aliases.
+Email alias / forwarding manager.
+
+**No virtualmin shellouts.** Reads `/etc/postfix/virtual` directly and
+mutates it with `postmap` after each change. See
+`feedback_mc2_replaces_webmin_virtualmin`.
 """
 from __future__ import annotations
 
-import json
+import os
+import re
 import subprocess
+import tempfile
+from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from mc2.auth import TokenPayload, require_super_admin
+from mc2.services import system_state as state
 
 router = APIRouter(prefix="/mail-aliases", tags=["mail-aliases"])
-
 Auth = Annotated[TokenPayload, Depends(require_super_admin)]
 
+POSTFIX_VIRTUAL = Path("/etc/postfix/virtual")
+
 
 # ---------------------------------------------------------------------------
-# helpers
+# Postfix virtual-map mutator
 # ---------------------------------------------------------------------------
 
-def _run(cmd: list[str], timeout: int = 20) -> tuple[int, str, str]:
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    return r.returncode, r.stdout.strip(), r.stderr.strip()
+_ENTRY_RE = re.compile(r"^\s*([^#\s][^\s]*)\s+(.+?)\s*$")
 
 
-def _vmin(*args: str) -> tuple[int, str, str]:
-    return _run(["sudo", "virtualmin"] + list(args))
+def _rewrite_virtual_map(mutate) -> None:
+    """
+    Read /etc/postfix/virtual, hand the line list to a mutator, write back
+    atomically, then run `postmap` to rebuild the hash.
 
-
-def _list_domains() -> list[str]:
-    rc, out, _ = _vmin("list-domains", "--name-only")
-    if rc != 0:
-        return []
-    return [d for d in out.splitlines() if d.strip()]
-
-
-def _parse_aliases(domain: str) -> list[dict]:
-    rc, out, _ = _vmin("list-aliases", "--domain", domain, "--json")
-    if rc != 0 or not out:
-        return []
+    The mutator receives the existing list of lines (strings, no trailing
+    newline) and must return the new list. Comments and blank lines are
+    preserved by callers — the mutator should pass them through unchanged.
+    """
     try:
-        data = json.loads(out)
-        aliases = []
-        for item in data.get("data", []):
-            from_addr = item.get("name", "")
-            to_list = item.get("values", {}).get("to", [])
-            to_clean = [t.replace("\\@", "@") for t in to_list]
-            aliases.append({
-                "domain": domain,
-                "from_address": from_addr,
-                "to_addresses": to_clean,
-            })
-        return aliases
-    except Exception:
-        return []
+        original = POSTFIX_VIRTUAL.read_text(errors="replace")
+    except OSError as exc:
+        raise HTTPException(502, f"Cannot read {POSTFIX_VIRTUAL}: {exc}")
+
+    new_lines = mutate(original.splitlines())
+    new_text = "\n".join(new_lines)
+    if not new_text.endswith("\n"):
+        new_text += "\n"
+
+    # Atomic replace via tempfile in the same dir
+    parent = POSTFIX_VIRTUAL.parent
+    with tempfile.NamedTemporaryFile("w", dir=parent, delete=False,
+                                     prefix=".virtual.tmp.") as tmp:
+        tmp.write(new_text)
+        tmp_path = Path(tmp.name)
+
+    # The Postfix dir is root-owned; use sudo install for the move + chown
+    rc = subprocess.run(
+        ["sudo", "install", "-m", "0644", "-o", "root", "-g", "root",
+         str(tmp_path), str(POSTFIX_VIRTUAL)],
+        capture_output=True, text=True, timeout=10,
+    )
+    try:
+        tmp_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if rc.returncode != 0:
+        raise HTTPException(502,
+            f"Failed to install new {POSTFIX_VIRTUAL}: {rc.stderr.strip() or rc.stdout.strip()}")
+
+    pm = subprocess.run(["sudo", "postmap", str(POSTFIX_VIRTUAL)],
+                        capture_output=True, text=True, timeout=15)
+    if pm.returncode != 0:
+        raise HTTPException(502,
+            f"postmap failed: {pm.stderr.strip() or pm.stdout.strip()}")
 
 
 # ---------------------------------------------------------------------------
-# endpoints
+# Endpoints
 # ---------------------------------------------------------------------------
 
 @router.get("")
-def list_aliases(
-    _: Auth,
-    domain: str | None = None,
-):
-    """List all mail aliases, optionally filtered to one domain."""
-    domains = [domain] if domain else _list_domains()
-    result: list[dict] = []
-    for d in domains:
-        result.extend(_parse_aliases(d))
-    return {"aliases": result, "total": len(result)}
+def list_aliases(_: Auth, domain: str | None = None):
+    """List every mail alias, optionally filtered to one domain."""
+    aliases = state.list_postfix_aliases(domain)
+    # Strip the internal from_local field — UI only needs domain, from_address, to_addresses.
+    out = [{"domain": a["domain"], "from_address": a["from_address"], "to_addresses": a["to_addresses"]}
+           for a in aliases]
+    return {"aliases": out, "total": len(out)}
 
 
 @router.get("/domains")
 def list_domains(_: Auth):
-    """List all Virtualmin domains."""
-    return {"domains": _list_domains()}
+    """List every domain MC² knows about (from Apache configs, not virtualmin)."""
+    return {"domains": [d.domain for d in state.list_domains()]}
 
 
 class AliasCreate(BaseModel):
@@ -89,23 +108,26 @@ class AliasCreate(BaseModel):
 
 @router.post("", status_code=201)
 def create_alias(payload: AliasCreate, _: Auth):
-    """Create a new mail alias (from_local@domain → to_addresses)."""
+    """Append a new alias to /etc/postfix/virtual."""
     from_local = payload.from_local.strip().lower()
     if not from_local or not payload.domain:
         raise HTTPException(400, "from_local and domain are required")
     if not payload.to_addresses:
         raise HTTPException(400, "at least one to_address required")
 
-    cmd = ["sudo", "virtualmin", "create-alias",
-           "--domain", payload.domain,
-           "--from", from_local]
-    for addr in payload.to_addresses:
-        cmd += ["--to", addr.strip()]
+    from_addr = f"{from_local}@{payload.domain}"
+    targets = ", ".join(t.strip() for t in payload.to_addresses if t.strip())
 
-    rc, out, err = _run(cmd)
-    if rc != 0:
-        raise HTTPException(500, err or "Failed to create alias")
-    return {"ok": True, "from_address": f"{from_local}@{payload.domain}"}
+    def mutate(lines):
+        # Refuse duplicates — if from_addr already exists, fail.
+        for ln in lines:
+            m = _ENTRY_RE.match(ln)
+            if m and m.group(1) == from_addr:
+                raise HTTPException(409, f"Alias {from_addr!r} already exists")
+        return lines + [f"{from_addr}\t{targets}"]
+
+    _rewrite_virtual_map(mutate)
+    return {"ok": True, "from_address": from_addr}
 
 
 class ForwardingUpdate(BaseModel):
@@ -116,35 +138,46 @@ class ForwardingUpdate(BaseModel):
 
 @router.put("")
 def update_alias(payload: ForwardingUpdate, _: Auth):
-    """Replace alias destinations by deleting and re-creating."""
+    """Replace an alias's destination list in-place."""
     from_local = payload.from_local.strip().lower()
+    from_addr = f"{from_local}@{payload.domain}"
+    targets = ", ".join(t.strip() for t in payload.to_addresses if t.strip())
 
-    # delete first
-    rc, _, err = _run(["sudo", "virtualmin", "delete-alias",
-                       "--domain", payload.domain,
-                       "--from", from_local])
-    if rc != 0:
-        raise HTTPException(500, err or "Failed to delete existing alias")
+    def mutate(lines):
+        found = False
+        out = []
+        for ln in lines:
+            m = _ENTRY_RE.match(ln)
+            if m and m.group(1) == from_addr:
+                out.append(f"{from_addr}\t{targets}")
+                found = True
+            else:
+                out.append(ln)
+        if not found:
+            raise HTTPException(404, f"Alias {from_addr!r} not found")
+        return out
 
-    # re-create
-    cmd = ["sudo", "virtualmin", "create-alias",
-           "--domain", payload.domain,
-           "--from", from_local]
-    for addr in payload.to_addresses:
-        cmd += ["--to", addr.strip()]
-
-    rc, _, err = _run(cmd)
-    if rc != 0:
-        raise HTTPException(500, err or "Failed to re-create alias")
+    _rewrite_virtual_map(mutate)
     return {"ok": True}
 
 
 @router.delete("/{domain}/{from_local}")
 def delete_alias(domain: str, from_local: str, _: Auth):
-    """Delete an email alias."""
-    rc, _, err = _run(["sudo", "virtualmin", "delete-alias",
-                       "--domain", domain,
-                       "--from", from_local])
-    if rc != 0:
-        raise HTTPException(500, err or "Failed to delete alias")
+    """Remove the matching line from /etc/postfix/virtual."""
+    from_addr = f"{from_local}@{domain}"
+
+    def mutate(lines):
+        found = False
+        out = []
+        for ln in lines:
+            m = _ENTRY_RE.match(ln)
+            if m and m.group(1) == from_addr:
+                found = True
+                continue
+            out.append(ln)
+        if not found:
+            raise HTTPException(404, f"Alias {from_addr!r} not found")
+        return out
+
+    _rewrite_virtual_map(mutate)
     return {"ok": True}

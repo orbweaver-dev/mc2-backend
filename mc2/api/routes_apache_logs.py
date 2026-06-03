@@ -1,10 +1,14 @@
 """
-Per-Domain Apache Log Viewer — reads access_log and error_log per Virtualmin domain.
+Per-domain Apache log viewer.
+
+**No virtualmin shellouts.** Domain list comes from Apache vhost files via
+`system_state.list_domains()`. Log file paths are taken from the parsed
+`ErrorLog` / `CustomLog` directives in each vhost (so we follow whatever
+the operator actually configured — typically `/var/log/virtualmin/<domain>_access_log`,
+but it could be anything).
 """
 from __future__ import annotations
 
-import json
-import os
 import subprocess
 from pathlib import Path
 from typing import Annotated
@@ -12,6 +16,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from mc2.auth import TokenPayload, require_super_admin
+from mc2.services import system_state as state
 
 router = APIRouter(prefix="/apache-logs", tags=["apache-logs"])
 Auth = Annotated[TokenPayload, Depends(require_super_admin)]
@@ -22,48 +27,41 @@ def _run(cmd: list[str], timeout: int = 15) -> tuple[int, str, str]:
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
-def _list_virtualmin_domains() -> list[dict]:
-    rc, out, _ = _run(["sudo", "virtualmin", "list-domains", "--json"])
-    if rc != 0 or not out:
-        return []
+def _log_pair_for(domain: str) -> tuple[Path | None, Path | None]:
+    """Return (access_log_path, error_log_path) from the parsed vhost."""
+    d = state.get_domain(domain)
+    if d is None:
+        return None, None
+    return (Path(d.access_log) if d.access_log else None,
+            Path(d.error_log)  if d.error_log  else None)
+
+
+def _size_mb(p: Path | None) -> float:
+    if not p or not p.exists():
+        return 0
     try:
-        data = json.loads(out)
-        result = []
-        for item in data.get("data", []):
-            v = item.get("values", {})
-            domain = item.get("name", "")
-            home = v.get("home_directory", [""])[0]
-            result.append({"domain": domain, "home": home})
-        return result
-    except Exception:
-        return []
-
-
-def _log_path(home: str, log_type: str) -> Path:
-    base = Path(home) / "logs"
-    if log_type == "error":
-        return base / "error_log"
-    return base / "access_log"
+        return round(p.stat().st_size / (1024 * 1024), 2)
+    except OSError:
+        return 0
 
 
 @router.get("/domains")
 def list_log_domains(_: Auth):
-    """List all domains with their log file info."""
-    domains = _list_virtualmin_domains()
-    result = []
-    for d in domains:
-        access = _log_path(d["home"], "access")
-        error = _log_path(d["home"], "error")
-        result.append({
-            "domain": d["domain"],
-            "access_log": str(access),
-            "error_log": str(error),
-            "access_exists": access.exists(),
-            "error_exists": error.exists(),
-            "access_size_mb": round(access.stat().st_size / (1024 * 1024), 2) if access.exists() else 0,
-            "error_size_mb": round(error.stat().st_size / (1024 * 1024), 2) if error.exists() else 0,
+    """One row per domain with its access / error log paths and sizes."""
+    out = []
+    for d in state.list_domains():
+        access = Path(d.access_log) if d.access_log else None
+        error  = Path(d.error_log)  if d.error_log  else None
+        out.append({
+            "domain":         d.domain,
+            "access_log":     str(access) if access else "",
+            "error_log":      str(error)  if error  else "",
+            "access_exists":  bool(access and access.exists()),
+            "error_exists":   bool(error  and error.exists()),
+            "access_size_mb": _size_mb(access),
+            "error_size_mb":  _size_mb(error),
         })
-    return {"domains": result}
+    return {"domains": out}
 
 
 @router.get("/tail")
@@ -74,35 +72,31 @@ def tail_log(
     lines: int = Query(100, ge=10, le=2000),
     search: str | None = Query(None),
 ):
-    """Return the last N lines of a domain's log, with optional keyword search."""
-    domains = _list_virtualmin_domains()
-    home = next((d["home"] for d in domains if d["domain"] == domain), None)
-    if not home:
-        raise HTTPException(404, f"Domain '{domain}' not found")
-
-    log_file = _log_path(home, log_type)
+    """Tail the last N lines of the chosen domain's log, optional grep filter."""
+    access, error = _log_pair_for(domain)
+    log_file = access if log_type == "access" else error
+    if log_file is None:
+        raise HTTPException(404, f"Domain {domain!r} not found")
     if not log_file.exists():
         raise HTTPException(404, f"Log file not found: {log_file}")
 
-    # Read last N lines via tail
-    rc, out, err = _run(["sudo", "tail", f"-{lines * 3 if search else lines}", str(log_file)])
+    rc, out, err = _run(
+        ["sudo", "tail", f"-{lines * 3 if search else lines}", str(log_file)],
+        timeout=20,
+    )
     if rc != 0:
         raise HTTPException(500, err or "Failed to read log")
 
     raw_lines = out.splitlines()
-
-    # Apply search filter
     if search:
         raw_lines = [ln for ln in raw_lines if search.lower() in ln.lower()]
-
-    # Return most recent first, up to `lines` count
     raw_lines = raw_lines[-lines:]
     raw_lines.reverse()
 
     return {
-        "domain": domain,
+        "domain":   domain,
         "log_type": log_type,
         "log_file": str(log_file),
-        "lines": raw_lines,
-        "count": len(raw_lines),
+        "lines":    raw_lines,
+        "count":    len(raw_lines),
     }
