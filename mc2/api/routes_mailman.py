@@ -102,51 +102,64 @@ def _parse_mailbox_users(text: str) -> list[dict]:
 	return out
 
 
+def _mailbox_users_for_record(d) -> list[dict]:
+	"""Project system_state mailbox users into the mailman response shape."""
+	from mc2.services import system_state
+	out: list[dict] = []
+	for su in system_state.list_users_for_domain(d.owner_user, d.domain):
+		email = system_state.email_address_for(su.username, d.owner_user, d.domain)
+		out.append({
+			"email":             email,
+			"user":              su.username,
+			"domain":            d.domain,
+			"real_name":         su.real_name or None,
+			"disabled":          su.shell in ("/usr/sbin/nologin", "/sbin/nologin", "/bin/false"),
+			"mail_location":     None,
+			"home_dir":          su.home,
+			"quota_used":        None,
+			"quota_used_bytes":  0,
+			"quota_total":       None,
+			"quota_total_bytes": None,
+			"spam_check":        False,
+		})
+	return out
+
+
 @router.get("")
 def mailman_index(_: Auth) -> dict:
-	"""Enumerate every mail account across every Virtualmin domain.
-
-	Single shelled-out call per domain — slow on large servers; client paginates.
-	"""
-	domains = _list_domains()
+	"""Enumerate every mail account across every domain (direct, no virtualmin)."""
+	from mc2.services import system_state
 	all_users: list[dict] = []
 	domain_counts: dict[str, int] = {}
-	errors: list[str] = []
-
-	for d in domains:
-		rc, out, err = _vmin("list-users", "--domain", d, "--multiline")
-		if rc != 0:
-			errors.append(f"{d}: virtualmin rc={rc} {err[:120]}")
-			continue
-		users = _parse_mailbox_users(out)
-		domain_counts[d] = len(users)
+	for d in system_state.list_domains():
+		users = _mailbox_users_for_record(d)
+		domain_counts[d.domain] = len(users)
 		all_users.extend(users)
 
 	all_users.sort(key=lambda u: (u.get("domain") or "", u.get("email") or ""))
-	totals = {
-		"domains": len(domains),
-		"mailboxes": len(all_users),
-		"quota_used_bytes": sum((u.get("quota_used_bytes") or 0) for u in all_users),
-	}
 	return {
-		"totals": totals,
+		"totals": {
+			"domains":          len(domain_counts),
+			"mailboxes":        len(all_users),
+			"quota_used_bytes": 0,  # populated by mail-quotas; this view stays cheap
+		},
 		"domain_counts": domain_counts,
-		"users": all_users,
-		"errors": errors,
+		"users":         all_users,
+		"errors":        [],
 	}
 
 
 @router.get("/domains")
 def mailman_domains(_: Auth) -> dict:
-	"""Just the domain list — cheap; useful for a domain selector before
-	loading the full enumeration."""
+	"""Just the domain list — cheap."""
 	return {"domains": _list_domains()}
 
 
 @router.get("/domain/{domain}")
 def mailman_domain(domain: Annotated[str, ...], _: Auth) -> dict:
-	rc, out, err = _vmin("list-users", "--domain", domain, "--multiline")
-	if rc != 0:
-		raise HTTPException(status_code=502, detail=f"virtualmin rc={rc}: {err[:200]}")
-	users = _parse_mailbox_users(out)
+	from mc2.services import system_state
+	d = system_state.get_domain(domain)
+	if d is None:
+		raise HTTPException(status_code=404, detail=f"Domain not found: {domain}")
+	users = _mailbox_users_for_record(d)
 	return {"domain": domain, "users": users, "count": len(users)}
