@@ -354,6 +354,20 @@ def list_databases(_: Auth, domain: str) -> dict:
     if rc != 0:
         raise HTTPException(status_code=502, detail=err.strip() or "virtualmin list-databases failed")
 
+    # Owner comes from the domain (virtualmin list-databases doesn't include it
+    # — every DB under a virtual server is owned by that server's Unix user).
+    owner = ""
+    try:
+        info_rc, info_out, _info_err = _vmin("list-domains", "--domain", domain, "--multiline")
+        if info_rc == 0:
+            for raw in info_out.splitlines():
+                line = raw.strip()
+                if line.startswith("Username:"):
+                    owner = line.split(":", 1)[1].strip()
+                    break
+    except Exception:
+        pass
+
     dbs: list[dict] = []
     current: dict | None = None
     for raw in out.splitlines():
@@ -371,27 +385,54 @@ def list_databases(_: Auth, domain: str) -> dict:
     if current is not None:
         dbs.append(current)
 
-    projected = [{
-        "name":  d["name"],
-        "type":  d["raw"].get("Type") or d["raw"].get("Database type") or "",
-        "size_mb": _to_mb(d["raw"].get("Size") or d["raw"].get("Disk usage") or ""),
-        "user":  d["raw"].get("Owner") or d["raw"].get("Username") or "",
-    } for d in dbs]
-    return {"domain": domain, "databases": projected, "count": len(projected)}
+    def _row(d: dict) -> dict:
+        raw = d["raw"]
+        # Prefer the integer-bytes field; fall back to the human-formatted size string.
+        size_mb: int | None = None
+        bs = raw.get("Byte size") or raw.get("Bytes")
+        if bs:
+            try:
+                size_mb = round(int(bs) / (1024 * 1024), 2)  # type: ignore[assignment]
+            except (ValueError, TypeError):
+                size_mb = None
+        if size_mb is None:
+            size_mb = _to_mb(raw.get("Size") or raw.get("Disk usage") or "")
+        return {
+            "name":    d["name"],
+            "type":    raw.get("Type") or raw.get("Database type") or "",
+            "size_mb": size_mb,
+            "tables":  _to_int(raw.get("Tables")),
+            "files":   _to_int(raw.get("Files")),
+            "used_by": raw.get("Used by scripts") or "",
+            "user":    raw.get("Owner") or raw.get("Username") or owner,
+        }
+
+    return {"domain": domain, "databases": [_row(d) for d in dbs], "count": len(dbs)}
 
 
-def _to_mb(s: str) -> int | None:
-    s = (s or "").strip().lower()
-    if not s or s in ("none", "—", "-"):
+def _to_int(s: str | None) -> int | None:
+    try:
+        return int(s) if s and s.strip() else None
+    except (ValueError, TypeError):
         return None
-    m = re.match(r"([0-9.]+)\s*(kb|mb|gb|tb|b)?", s)
+
+
+def _to_mb(s: str) -> int | float | None:
+    """Parse 'Size' strings like '87.44 MiB' / '8 KiB' / '1.2 GiB' (Virtualmin
+    uses IEC binary units with a capital I) into a MB float. Fallback path —
+    callers should prefer the integer 'Byte size' field where available."""
+    s = (s or "").strip()
+    if not s or s.lower() in ("none", "—", "-"):
+        return None
+    m = re.match(r"([0-9.]+)\s*([KMGT]?i?B)?", s)
     if not m:
         return None
     try:
         v = float(m.group(1))
-        unit = (m.group(2) or "b")
-        mult = {"b": 1/(1024*1024), "kb": 1/1024, "mb": 1, "gb": 1024, "tb": 1024*1024}[unit]
-        return int(v * mult)
+        unit = (m.group(2) or "B").upper().replace("I", "")  # KIB -> KB, MIB -> MB, etc.
+        mult = {"B": 1/(1024*1024), "KB": 1/1024, "MB": 1, "GB": 1024, "TB": 1024*1024}[unit]
+        out = v * mult
+        return round(out, 2) if out < 100 else int(out)
     except (ValueError, KeyError):
         return None
 
