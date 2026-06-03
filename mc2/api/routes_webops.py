@@ -49,6 +49,8 @@ def _save_registry(servers: list[dict]) -> None:
 
 
 def _find_server(server_id: str) -> dict:
+    if server_id == "self-mc2-host":
+        return _self_server_entry()
     for s in _load_registry():
         if s.get("id") == server_id:
             return s
@@ -525,9 +527,49 @@ class ServerActionRequest(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+def _self_server_entry() -> dict:
+    """
+    Synthetic 'self' server representing the host MC² runs on.
+
+    MC² is a master control panel — the local host is always under its
+    own management, so it should always appear in the WebOps server list
+    without the operator needing to "add" it. Stable id "self-mc2-host"
+    so subsequent calls (servers/{id}/vhosts, /status, etc.) recognise it
+    as the local host and use direct CLI shellouts instead of SSH.
+    """
+    import socket
+    try:
+        hostname = socket.gethostname()
+    except Exception:
+        hostname = "localhost"
+    return {
+        "id":           "self-mc2-host",
+        "display_name": "This Host (MC²)",
+        "hostname":     hostname,
+        "ip":           "127.0.0.1",
+        "type":         "local",
+        "provider":     "self",
+        "os":           "linux",
+        "ssh_user":     "",
+        "ssh_port":     0,
+        "ssh_key":      "",
+        "libvirt_name": "",
+        "tags":         ["self", "primary"],
+        "notes":        "Local host — auto-registered. Vhost / database / file operations execute directly via the mc2 service user's sudo grants.",
+        "added_at":     "",
+        "added_by":     "system",
+        "is_self":      True,
+    }
+
+
 @router.get("/servers")
 async def list_servers(_: str = Depends(require_super_admin)) -> dict:
-    servers = _load_registry()
+    """
+    Return the registered remote servers PLUS a synthetic 'self' entry for
+    the local host so the WebOps UI never shows an empty server list on a
+    single-host MC² deployment.
+    """
+    servers = [_self_server_entry()] + _load_registry()
     return {"servers": servers, "count": len(servers), "checked_at": datetime.now(UTC).isoformat()}
 
 
@@ -594,6 +636,30 @@ async def server_status(server_id: str, _: str = Depends(require_super_admin)) -
         "checked_at": datetime.now(UTC).isoformat(),
     }
 
+    # Local self — read directly via psutil instead of pretending to SSH
+    # into our own host. This is the synthetic server entry auto-included
+    # in /webops/servers so the registry is never empty on single-host MC².
+    if stype == "local":
+        import psutil
+        result["is_up"]  = True
+        result["state"]  = "running"
+        result["ping"]   = {"alive": True, "rtt_ms": 0}
+        result["ssh"]    = {"reachable": None, "note": "local host — no SSH needed"}
+        try:
+            mem = psutil.virtual_memory()
+            result["metrics"] = {
+                "cpu_percent":   psutil.cpu_percent(interval=0.2),
+                "load_avg_1m":   psutil.getloadavg()[0],
+                "memory_used_gb":  round(mem.used / 1e9, 2),
+                "memory_total_gb": round(mem.total / 1e9, 2),
+                "uptime_seconds":  int(__import__("time").time() - psutil.boot_time()),
+            }
+        except Exception:
+            result["metrics"] = {}
+        result["services"] = []
+        result["ports"]    = []
+        return result
+
     # Ping check
     result["ping"] = _ping_check(server["ip"])
 
@@ -623,7 +689,33 @@ async def server_status(server_id: str, _: str = Depends(require_super_admin)) -
 
 @router.get("/servers/{server_id}/vhosts")
 async def server_vhosts(server_id: str, _: str = Depends(require_super_admin)) -> dict:
-    """Return virtual host configurations scraped from the remote server."""
+    """Return virtual host configurations for the named server."""
+    # Local "self" server: read the host's own Virtualmin domain list
+    # directly via the CLI instead of pretending we'd SSH into ourselves.
+    if server_id == "self-mc2-host":
+        try:
+            from mc2.api.routes_vhost import list_domains as _vhost_list_domains
+            vd = _vhost_list_domains(_="ok")
+        except Exception as exc:
+            return {"vhosts": [], "web_servers": [], "count": 0,
+                    "note": f"Failed to enumerate local vhosts: {exc}",
+                    "checked_at": datetime.now(UTC).isoformat()}
+        vhosts = [{
+            "domain":     d["domain"],
+            "server":     "apache2",
+            "docroot":    d.get("home") or "",
+            "owner":      d.get("user"),
+            "ip":         d.get("ip"),
+            "ssl":        "ssl" in (d.get("features") or []),
+            "features":   d.get("features") or [],
+        } for d in (vd.get("domains") or [])]
+        return {
+            "vhosts": vhosts,
+            "web_servers": ["apache2"],
+            "count": len(vhosts),
+            "checked_at": datetime.now(UTC).isoformat(),
+        }
+
     server = _find_server(server_id)
     if server.get("type") != "ssh":
         return {"vhosts": [], "web_servers": [], "note": "vhost scraping only available for SSH servers",
