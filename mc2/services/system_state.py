@@ -427,13 +427,25 @@ def list_mariadb_databases_for(domain_owner: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _find_zone_file(domain: str) -> Path | None:
-    """Search every BIND zone-dir candidate every time — no path memo."""
+    """
+    Search every BIND zone-dir candidate every time — no path memo.
+
+    Tolerates EACCES on directories MC² can't traverse (e.g. /var/lib/bind
+    is bind:bind 750 on a default Debian install). A missing-or-unreadable
+    zone just means "no DNS feature for this domain" — never raise.
+    """
     for base in BIND_ZONES_CANDIDATES:
-        if not base.is_dir():
+        try:
+            if not base.is_dir():
+                continue
+        except OSError:
             continue
         for p in (base / f"{domain}.hosts", base / f"{domain}.zone", base / domain):
-            if p.is_file():
-                return p
+            try:
+                if p.is_file():
+                    return p
+            except OSError:
+                continue
     return None
 
 

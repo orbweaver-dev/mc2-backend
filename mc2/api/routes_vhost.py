@@ -52,18 +52,40 @@ def _check_username(name: str) -> str:
 
 
 def _features_for(d: state.DomainRecord) -> list[str]:
-    """Derive the feature flags the UI renders as chips."""
+    """
+    Derive the feature flags the UI renders as chips.
+
+    Every probe is wrapped so a single unreadable file (e.g. a BIND zone
+    in a directory MC² can't traverse) returns False for that feature
+    instead of 500ing the entire picker. The vhost picker is on the hot
+    path; it must stay resilient to any one source's quirks.
+    """
     feats = []
-    if d.has_http or d.has_https:
-        feats.append("web")
-    if d.ssl_enabled:
-        feats.append("ssl")
-    if state.list_postfix_aliases(d.domain) or _has_mailboxes(d.owner_user, d.domain):
-        feats.append("mail")
-    if state._find_zone_file(d.domain) is not None:
-        feats.append("dns")
-    if state.list_mariadb_databases_for(d.owner_user):
-        feats.append("mysql")
+    try:
+        if d.has_http or d.has_https:
+            feats.append("web")
+    except Exception as exc:
+        logger.warning("features web check failed for %s: %s", d.domain, exc)
+    try:
+        if d.ssl_enabled:
+            feats.append("ssl")
+    except Exception as exc:
+        logger.warning("features ssl check failed for %s: %s", d.domain, exc)
+    try:
+        if state.list_postfix_aliases(d.domain) or _has_mailboxes(d.owner_user, d.domain):
+            feats.append("mail")
+    except Exception as exc:
+        logger.warning("features mail check failed for %s: %s", d.domain, exc)
+    try:
+        if state._find_zone_file(d.domain) is not None:
+            feats.append("dns")
+    except Exception as exc:
+        logger.warning("features dns check failed for %s: %s", d.domain, exc)
+    try:
+        if state.list_mariadb_databases_for(d.owner_user):
+            feats.append("mysql")
+    except Exception as exc:
+        logger.warning("features mysql check failed for %s: %s", d.domain, exc)
     return feats
 
 
