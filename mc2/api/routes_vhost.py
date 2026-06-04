@@ -103,6 +103,30 @@ def _has_mailboxes(owner: str, domain: str) -> bool:
 # Domains
 # ---------------------------------------------------------------------------
 
+@router.get("/ssl-status")
+def list_ssl_status(_: Auth) -> dict:
+    """Per-domain SSL certificate status — backs `/webops/domains`.
+
+    Reads each vhost's `SSLCertificateFile`, parses with `cryptography.x509`,
+    returns expiry / issuer / SANs / days-left / valid. Domains without an
+    SSLCertificateFile or with unreadable certs appear with an `error` field.
+    """
+    rows = state.list_ssl_status()
+    summary = {
+        "total":          len(rows),
+        "ssl_enabled":    sum(1 for r in rows if r["ssl_enabled"]),
+        "valid":          sum(1 for r in rows if r.get("valid")),
+        "expiring_soon":  sum(1 for r in rows
+                              if r.get("days_left") is not None
+                              and 0 <= r["days_left"] < 30),
+        "expired":        sum(1 for r in rows
+                              if r.get("days_left") is not None
+                              and r["days_left"] < 0),
+        "error":          sum(1 for r in rows if r.get("error")),
+    }
+    return {"rows": rows, "summary": summary}
+
+
 @router.get("/domains")
 def list_domains(_: Auth) -> dict:
     """List every virtual server by parsing Apache vhost configs directly."""

@@ -17,6 +17,7 @@ Everything here is read-only. Mutations live in dedicated service modules
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import pwd
 import re
@@ -59,6 +60,7 @@ class VhostBlock:
     ip6:            str = ""
     ports:          set[int] = field(default_factory=set)
     ssl_enabled:    bool = False
+    ssl_cert_file:  str = ""
     error_log:      str = ""
     access_log:     str = ""
     suexec_user:    str = ""
@@ -108,6 +110,8 @@ def _parse_one_block(listen: str, body: str, source: Path) -> VhostBlock:
             block.access_log = val.split()[0]
         elif key == "sslengine" and val.lower() in ("on", "true", "1"):
             block.ssl_enabled = True
+        elif key == "sslcertificatefile" and not block.ssl_cert_file:
+            block.ssl_cert_file = val
         elif key == "suexecusergroup" and not block.suexec_user:
             block.suexec_user = val.split()[0]
     return block
@@ -139,6 +143,7 @@ class DomainRecord:
     ip:            str
     ip6:           str
     ssl_enabled:   bool
+    ssl_cert_file: str
     has_http:      bool
     has_https:     bool
     error_log:     str
@@ -215,13 +220,19 @@ def list_domains() -> list[DomainRecord]:
         has_http  = any(80  in b.ports for b in blocks)
         has_https = any(443 in b.ports for b in blocks)
         ssl_enabled = any(b.ssl_enabled for b in blocks)
+        # Prefer the cert from a :443 / SSLEngine-on block; fall back to any.
+        ssl_cert_file = next(
+            (b.ssl_cert_file for b in blocks if b.ssl_cert_file and (443 in b.ports or b.ssl_enabled)),
+            next((b.ssl_cert_file for b in blocks if b.ssl_cert_file), "")
+        )
 
         owner_user, owner_uid = _owner_of_path(docroot)
 
         records.append(DomainRecord(
             domain=domain, aliases=aliases, owner_user=owner_user,
             owner_uid=owner_uid, docroot=docroot, ip=ip, ip6=ip6,
-            ssl_enabled=ssl_enabled, has_http=has_http, has_https=has_https,
+            ssl_enabled=ssl_enabled, ssl_cert_file=ssl_cert_file,
+            has_http=has_http, has_https=has_https,
             error_log=error_log, access_log=access_log, config_file=config_file,
         ))
 
@@ -505,6 +516,111 @@ def list_dns_records(domain: str) -> list[dict]:
             continue
         records.append({"name": name, "ttl": ttl, "class": cls, "type": rtype, "value": rdata})
     return records
+
+
+# ---------------------------------------------------------------------------
+# SSL certificate parsing
+# ---------------------------------------------------------------------------
+
+def _read_cert_pem(path: str) -> str | None:
+    """Read a PEM cert file. Falls back to `sudo cat` because letsencrypt/
+    virtualmin keep certs root-readable only."""
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        pass
+    r = subprocess.run(
+        ["sudo", "-n", "cat", path],
+        capture_output=True, text=True, timeout=10,
+    )
+    return r.stdout if r.returncode == 0 else None
+
+
+def _parse_cert(pem: str) -> dict | None:
+    """Parse a PEM-encoded certificate. Returns issuer / expiry / SANs /
+    days_left / valid, or None if parsing fails."""
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID, ExtensionOID
+    except ImportError:
+        return None
+    try:
+        cert = x509.load_pem_x509_certificate(pem.encode("utf-8"))
+    except (ValueError, TypeError):
+        return None
+
+    def _cn(name):
+        try:
+            return name.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+        except (IndexError, AttributeError):
+            return ""
+
+    sans: list[str] = []
+    try:
+        ext = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+        sans = ext.value.get_values_for_type(x509.DNSName)
+    except x509.ExtensionNotFound:
+        pass
+
+    not_after = cert.not_valid_after_utc
+    not_before = cert.not_valid_before_utc
+    now = dt.datetime.now(dt.timezone.utc)
+    days_left = (not_after - now).days
+    return {
+        "subject_cn": _cn(cert.subject),
+        "issuer_cn":  _cn(cert.issuer),
+        "issuer":     cert.issuer.rfc4514_string(),
+        "not_before": not_before.isoformat(),
+        "not_after":  not_after.isoformat(),
+        "expiry":     not_after.date().isoformat(),
+        "days_left":  days_left,
+        "valid":      not_before <= now <= not_after,
+        "sans":       sans,
+    }
+
+
+def ssl_status_for(domain: DomainRecord) -> dict:
+    """SSL status for one domain. Returns a flat dict matching the contract
+    of /api/v1/cc/vhost/ssl-status."""
+    base = {
+        "domain":     domain.domain,
+        "ssl_enabled": domain.ssl_enabled,
+        "cert_file":  domain.ssl_cert_file or "",
+        "subject_cn": "",
+        "issuer_cn":  "",
+        "issuer":     "",
+        "expiry":     "",
+        "not_before": "",
+        "not_after":  "",
+        "days_left":  None,
+        "valid":      False,
+        "sans":       [],
+        "error":      "",
+    }
+    if not domain.ssl_enabled:
+        base["error"] = "ssl not enabled in vhost"
+        return base
+    if not domain.ssl_cert_file:
+        base["error"] = "no SSLCertificateFile in vhost"
+        return base
+    pem = _read_cert_pem(domain.ssl_cert_file)
+    if pem is None:
+        base["error"] = "cert unreadable (check sudoers grants)"
+        return base
+    parsed = _parse_cert(pem)
+    if parsed is None:
+        base["error"] = "cert parse failed"
+        return base
+    base.update(parsed)
+    return base
+
+
+def list_ssl_status() -> list[dict]:
+    """SSL status for every Apache vhost on the host."""
+    return [ssl_status_for(d) for d in list_domains()]
 
 
 # No cache layer in this module — operator directive 2026-06-03: "I really
