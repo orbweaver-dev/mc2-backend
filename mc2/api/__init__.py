@@ -62,6 +62,7 @@ from .routes_domain_bandwidth import router as domain_bandwidth_router
 from .routes_awstats import router as awstats_router
 from .routes_themes import router as themes_router
 from .routes_vhost import router as vhost_router
+from .routes_wordpress import router as wordpress_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -173,6 +174,8 @@ api_router.include_router(awstats_router)
 # Theme system — operator-editable CSS variable bundles, one active at a time
 api_router.include_router(themes_router)
 api_router.include_router(vhost_router)
+# WordPress Fleet Manager — auto-discovers WP installs from vhost docroots
+api_router.include_router(wordpress_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py
