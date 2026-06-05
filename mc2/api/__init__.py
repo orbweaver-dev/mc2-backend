@@ -63,6 +63,7 @@ from .routes_awstats import router as awstats_router
 from .routes_themes import router as themes_router
 from .routes_vhost import router as vhost_router
 from .routes_wordpress import router as wordpress_router
+from .routes_joomla import router as joomla_router
 
 # All control center routes under /api/v1/cc/
 api_router = APIRouter(prefix="/api/v1/cc")
@@ -176,6 +177,8 @@ api_router.include_router(themes_router)
 api_router.include_router(vhost_router)
 # WordPress Fleet Manager — auto-discovers WP installs from vhost docroots
 api_router.include_router(wordpress_router)
+# Joomla Fleet Manager — auto-discovers Joomla installs from vhost docroots
+api_router.include_router(joomla_router)
 
 # Public edge registration (no JWT — separate prefix /api/v1/edge/)
 # This is mounted directly on the FastAPI app in main.py
