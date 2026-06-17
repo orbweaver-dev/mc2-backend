@@ -54,6 +54,7 @@ from .routes_wp_seo import router as wp_seo_router
 from .routes_teleops import router as teleops_router
 from .routes_mailman import router as mailman_router
 from .routes_autoresponder import router as autoresponder_router
+from .routes_dmarc import router as dmarc_router
 from .routes_ftp_users import router as ftp_users_router
 from .routes_usermin import router as usermin_router
 from .routes_traceroute import router as traceroute_router
@@ -162,6 +163,7 @@ api_router.include_router(teleops_router)
 api_router.include_router(mailman_router)
 # Email Autoresponder & Vacation Manager — per-mailbox autoreply CRUD
 api_router.include_router(autoresponder_router)
+api_router.include_router(dmarc_router)
 # FTP / SFTP User Manager — virtualmin FTP user CRUD across all domains
 api_router.include_router(ftp_users_router)
 # Usermin Configuration — read-only status + config snapshot of usermin.service
