@@ -270,9 +270,16 @@ def _collector_health() -> dict:
 def email_auth_overview(_: Auth):
     """Cross-domain DMARC/SPF posture + collector health + computed issues.
     Powers the WebOps Email Authentication page and the MC² notifications."""
+    # Non-sending service subdomains never need DMARC — exclude them as noise.
+    _SKIP = ("autoconfig.", "autodiscover.", "mail.", "www.", "webmail.",
+             "cpanel.", "webdisk.", "mta-sts.", "smtp.", "imap.", "pop.", "ns.")
     try:
         from mc2.services import system_state as state
-        domains = sorted({d.domain for d in state.list_domains() if not getattr(d, "parent", "")})
+        domains = sorted({
+            d.domain for d in state.list_domains()
+            if not getattr(d, "parent", "")
+            and not d.domain.startswith(_SKIP)
+        })
     except Exception:
         domains = []
 
