@@ -124,8 +124,14 @@ def main() -> int:
         except Exception:
             state = set()
 
+    # Expand glob patterns (e.g. /home/*/homes/admin/Maildir) to real dirs.
+    maildirs: list[str] = []
+    for pat in cfg.get("maildirs", []):
+        maildirs.extend(glob.glob(pat) if any(c in pat for c in "*?[") else [pat])
+    maildirs = sorted({m for m in maildirs if os.path.isdir(m)})
+
     scanned = imported = 0
-    for md in cfg.get("maildirs", []):
+    for md in maildirs:
         for msgfile in maildir_messages(md):
             key = os.path.basename(msgfile).split(":")[0]   # stable Maildir id
             if key in state:
