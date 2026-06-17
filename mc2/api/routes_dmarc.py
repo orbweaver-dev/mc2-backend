@@ -225,3 +225,108 @@ def dmarc_analyze(_: Auth, domain: str = Query(...)):
         "dmarc": dmarc, "spf": spf, "dkim": dkim,
         "reports": reports, "report_dirs": REPORT_DIRS,
     }
+
+
+# ── Cross-domain overview + health (visibility + notifications) ─────────────────
+import subprocess as _sp
+from datetime import datetime, timezone
+
+
+def _domain_report_stat(domain: str) -> dict:
+    d = os.path.join(REPORT_DIRS[0], domain)
+    files = glob.glob(os.path.join(d, "*.xml")) if os.path.isdir(d) else []
+    if not files:
+        return {"count": 0, "last_report": None, "age_days": None}
+    last = max(os.path.getmtime(f) for f in files)
+    age = (datetime.now(timezone.utc).timestamp() - last) / 86400.0
+    return {"count": len(files),
+            "last_report": datetime.fromtimestamp(last, timezone.utc).isoformat(),
+            "age_days": round(age, 1)}
+
+
+def _collector_health() -> dict:
+    """systemd timer state + overall report freshness."""
+    out = {"timer_active": None, "total_reports": 0, "newest_age_days": None,
+           "state_path": os.path.join(REPORT_DIRS[0], ".collector-state.json")}
+    try:
+        r = _sp.run(["systemctl", "is-active", "mc2-dmarc-collector.timer"],
+                    capture_output=True, text=True, timeout=5)
+        out["timer_active"] = r.stdout.strip() == "active"
+    except Exception:
+        pass
+    newest = 0.0
+    for f in glob.glob(os.path.join(REPORT_DIRS[0], "*", "*.xml")):
+        out["total_reports"] += 1
+        m = os.path.getmtime(f)
+        if m > newest:
+            newest = m
+    if newest:
+        out["newest_age_days"] = round(
+            (datetime.now(timezone.utc).timestamp() - newest) / 86400.0, 1)
+    return out
+
+
+@router.get("/overview")  # GET /api/v1/cc/dmarc/overview
+def email_auth_overview(_: Auth):
+    """Cross-domain DMARC/SPF posture + collector health + computed issues.
+    Powers the WebOps Email Authentication page and the MC² notifications."""
+    try:
+        from mc2.services import system_state as state
+        domains = sorted({d.domain for d in state.list_domains() if not getattr(d, "parent", "")})
+    except Exception:
+        domains = []
+
+    rows, issues = [], []
+    for dom in domains:
+        dmarc = _analyze_dmarc(dom)
+        spf = _analyze_spf(dom)
+        rep = _domain_report_stat(dom)
+        score = 0
+        if dmarc["present"]:
+            score += 50
+            if dmarc.get("policy") in ("quarantine", "reject"):
+                score += 20
+        if spf["present"]:
+            score += 30
+        rows.append({
+            "domain": dom, "dmarc": dmarc["present"], "policy": dmarc.get("policy"),
+            "spf": spf["present"], "score": score, "rua": dmarc.get("rua", []),
+            "reports": rep["count"], "last_report": rep["last_report"],
+            "report_age_days": rep["age_days"],
+        })
+
+        def add(sev, msg):
+            issues.append({"domain": dom, "severity": sev, "message": msg,
+                           "key": f"emailauth:{dom}:{msg[:24]}"})
+
+        if not dmarc["present"]:
+            add("warning", "No DMARC record — domain is unprotected against spoofing.")
+        elif dmarc.get("policy") == "none":
+            add("info", "DMARC is p=none (monitor only) — not enforcing.")
+        if dmarc["present"] and not dmarc.get("rua"):
+            add("info", "DMARC has no rua= — aggregate reports won't be delivered.")
+        if not spf["present"]:
+            add("warning", "No SPF record published.")
+        if dmarc["present"] and dmarc.get("rua") and rep["count"] == 0:
+            add("warning", "DMARC rua is set but no aggregate reports collected yet.")
+        elif rep["count"] and (rep["age_days"] or 0) > 14:
+            add("warning", f"No new DMARC reports in {int(rep['age_days'])} days — collection may be broken.")
+
+    coll = _collector_health()
+    if coll["timer_active"] is False:
+        issues.append({"domain": "(collector)", "severity": "critical",
+                       "message": "DMARC collector timer is not active.",
+                       "key": "emailauth:collector:timer"})
+
+    sev_rank = {"critical": 0, "warning": 1, "info": 2}
+    issues.sort(key=lambda i: sev_rank.get(i["severity"], 9))
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "domains": rows, "issues": issues, "collector": coll,
+        "summary": {
+            "domains": len(rows),
+            "protected": sum(1 for r in rows if r["dmarc"] and r["policy"] in ("quarantine", "reject")),
+            "issues": len(issues),
+            "critical": sum(1 for i in issues if i["severity"] == "critical"),
+        },
+    }
