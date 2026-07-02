@@ -335,3 +335,180 @@ def inspect_url(
             ],
         },
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Google Analytics 4 — same service account, analytics.readonly scope.
+# The SA must be granted Viewer on the GA account (or per property) in the
+# GA Admin UI; grants at the ACCOUNT level cover every site's property.
+# ═══════════════════════════════════════════════════════════════════════════
+
+GA_SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
+GA_ADMIN_BASE = "https://analyticsadmin.googleapis.com/v1beta"
+GA_DATA_BASE = "https://analyticsdata.googleapis.com/v1beta"
+
+# domain-host → property info. Discovering the map costs one Admin API call
+# per property (to read its data streams), so cache it for an hour.
+_ga_prop_cache: dict = {"at": 0.0, "map": {}}
+
+
+def _ga_property_map(token: str, force: bool = False) -> dict[str, dict]:
+    now = time.time()
+    if not force and _ga_prop_cache["map"] and now - _ga_prop_cache["at"] < 3600:
+        return _ga_prop_cache["map"]
+
+    mapping: dict[str, dict] = {}
+    data = _gsc("GET", "accountSummaries?pageSize=200", token, base=GA_ADMIN_BASE)
+    for acct in data.get("accountSummaries", []):
+        for prop in acct.get("propertySummaries", []):
+            prop_id = prop["property"]          # "properties/123456789"
+            streams = _gsc("GET", f"{prop_id}/dataStreams", token, base=GA_ADMIN_BASE)
+            for s in streams.get("dataStreams", []):
+                web = s.get("webStreamData") or {}
+                uri = web.get("defaultUri") or ""
+                host = urllib.parse.urlparse(uri).netloc.lower()
+                host = host[4:] if host.startswith("www.") else host
+                if host:
+                    mapping[host] = {
+                        "property":       prop_id,
+                        "display_name":   prop.get("displayName", ""),
+                        "account":        acct.get("displayName", ""),
+                        "measurement_id": web.get("measurementId", ""),
+                        "stream_uri":     uri,
+                    }
+    _ga_prop_cache["map"] = mapping
+    _ga_prop_cache["at"] = now
+    return mapping
+
+
+def _ga_resolve(domain: str, token: str) -> dict:
+    host = domain.lower()
+    host = host[4:] if host.startswith("www.") else host
+    mapping = _ga_property_map(token)
+    if host not in mapping:
+        # One forced refresh in case the property was added since the cache
+        mapping = _ga_property_map(token, force=True)
+    if host not in mapping:
+        raise HTTPException(404, f"No GA4 web data stream found for {domain}. "
+                                 "Check that the property's data stream URI matches the domain "
+                                 "and the service account has Viewer access in GA Admin.")
+    return mapping[host]
+
+
+def _ga_rows(report: dict) -> list[dict]:
+    """Flatten a runReport response into [{<dim>: v, <metric>: n, ...}, ...]."""
+    dims = [h["name"] for h in report.get("dimensionHeaders", [])]
+    mets = [h["name"] for h in report.get("metricHeaders", [])]
+    out = []
+    for row in report.get("rows", []):
+        r: dict = {}
+        for i, d in enumerate(dims):
+            r[d] = row.get("dimensionValues", [])[i].get("value", "")
+        for i, m in enumerate(mets):
+            v = row.get("metricValues", [])[i].get("value", "0")
+            r[m] = float(v) if "." in v else int(v)
+        out.append(r)
+    return out
+
+
+@router.get("/ga/properties")
+def ga_properties(refresh: bool = Query(False), _: dict = Depends(require_super_admin)):
+    """All GA4 properties visible to the service account, keyed by domain."""
+    token = _get_sa_token(GA_SCOPE)
+    mapping = _ga_property_map(token, force=refresh)
+    return {"properties": mapping, "count": len(mapping)}
+
+
+@router.get("/ga/report")
+def ga_report(
+    domain: str = Query(...),
+    days: int = Query(28, ge=7, le=365),
+    _: dict = Depends(require_super_admin),
+):
+    """One-call GA4 traffic report for a domain: totals (with previous-period
+    comparison), daily timeseries, top pages, sources, devices, countries,
+    plus realtime active users."""
+    token = _get_sa_token(GA_SCOPE)
+    prop = _ga_resolve(domain, token)
+    prop_id = prop["property"]
+
+    end = datetime.date.today() - datetime.timedelta(days=1)   # GA lags ~1 day
+    start = end - datetime.timedelta(days=days - 1)
+    prev_end = start - datetime.timedelta(days=1)
+    prev_start = prev_end - datetime.timedelta(days=days - 1)
+    rng = [{"startDate": str(start), "endDate": str(end)}]
+    rng_with_prev = [
+        {"startDate": str(start), "endDate": str(end)},
+        {"startDate": str(prev_start), "endDate": str(prev_end)},
+    ]
+
+    METRICS = [{"name": m} for m in (
+        "activeUsers", "sessions", "screenPageViews",
+        "newUsers", "engagementRate", "averageSessionDuration",
+    )]
+
+    batch = _gsc("POST", f"{prop_id}:batchRunReports", token, {
+        "requests": [
+            {"dateRanges": rng_with_prev, "metrics": METRICS},
+            {"dateRanges": rng, "dimensions": [{"name": "date"}],
+             "metrics": [{"name": "activeUsers"}, {"name": "sessions"},
+                          {"name": "screenPageViews"}],
+             "orderBys": [{"dimension": {"dimensionName": "date"}}], "limit": 366},
+            {"dateRanges": rng, "dimensions": [{"name": "pagePath"}],
+             "metrics": [{"name": "screenPageViews"}, {"name": "activeUsers"}],
+             "orderBys": [{"metric": {"metricName": "screenPageViews"}, "desc": True}],
+             "limit": 10},
+            {"dateRanges": rng,
+             "dimensions": [{"name": "sessionSource"}, {"name": "sessionMedium"}],
+             "metrics": [{"name": "sessions"}, {"name": "activeUsers"}],
+             "orderBys": [{"metric": {"metricName": "sessions"}, "desc": True}],
+             "limit": 10},
+            {"dateRanges": rng, "dimensions": [{"name": "deviceCategory"}],
+             "metrics": [{"name": "activeUsers"}, {"name": "sessions"}]},
+        ],
+    }, base=GA_DATA_BASE)
+    reports = batch.get("reports", [])
+
+    def rep(i: int) -> dict:
+        return reports[i] if i < len(reports) else {}
+
+    # Totals — dateRange dimension appears when 2 ranges are requested
+    totals_rows = _ga_rows(rep(0))
+    cur = {}
+    prev = {}
+    for r in totals_rows:
+        tag = r.pop("dateRange", "date_range_0")
+        if tag == "date_range_0":
+            cur = r
+        else:
+            prev = r
+
+    countries = _gsc("POST", f"{prop_id}:runReport", token, {
+        "dateRanges": rng, "dimensions": [{"name": "country"}],
+        "metrics": [{"name": "activeUsers"}],
+        "orderBys": [{"metric": {"metricName": "activeUsers"}, "desc": True}],
+        "limit": 8,
+    }, base=GA_DATA_BASE)
+
+    try:
+        realtime = _gsc("POST", f"{prop_id}:runRealtimeReport", token, {
+            "metrics": [{"name": "activeUsers"}],
+        }, base=GA_DATA_BASE)
+        rt_rows = _ga_rows(realtime)
+        active_now = int(rt_rows[0]["activeUsers"]) if rt_rows else 0
+    except HTTPException:
+        active_now = 0   # realtime not critical — don't fail the report
+
+    return {
+        "domain": domain,
+        "property": {k: prop[k] for k in ("property", "display_name", "measurement_id")},
+        "period": {"start": str(start), "end": str(end), "days": days},
+        "active_now": active_now,
+        "totals": cur,
+        "previous": prev,
+        "timeseries": _ga_rows(rep(1)),
+        "pages": _ga_rows(rep(2)),
+        "sources": _ga_rows(rep(3)),
+        "devices": _ga_rows(rep(4)),
+        "countries": _ga_rows(countries),
+    }
