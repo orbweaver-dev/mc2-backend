@@ -126,13 +126,13 @@ async def execute_command(req: TerminalRequest, _: str = Depends(require_super_a
             "stderr": result.stderr,
             "returncode": result.returncode,
             "command": req.command,
-            "cwd": cwd,
+            "cwd": safe_cwd,
             "executed_at": datetime.now(UTC).isoformat(),
         }
     except subprocess.TimeoutExpired:
         return {
             "stdout": "", "stderr": "Command timed out after 30 seconds",
-            "returncode": -1, "command": req.command, "cwd": cwd,
+            "returncode": -1, "command": req.command, "cwd": safe_cwd,
             "executed_at": datetime.now(UTC).isoformat(),
         }
     except Exception as e:

@@ -1,0 +1,104 @@
+name: ci
+
+# Self-hosted runner on beast64 (beast64-mc2-backend). GitHub-hosted runners
+# are off-limits; the `beast64` label is the house convention for pinning to it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test
+    runs-on: [self-hosted, beast64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install -q --upgrade pip
+          pip install -q -r requirements.txt
+          pip install -q ruff pytest pytest-asyncio pytest-cov
+
+      # BLOCKING — things that are true today and must stay true.
+      #
+      # The error subset only: undefined names, syntax errors, broken f-strings.
+      # It is not a style gate — a full `ruff check` reports ~2,500 findings on
+      # this repo, most of them tab indentation, and a gate that is red from the
+      # first run is one everybody learns to scroll past. This subset found
+      # three real crashes the day it was added: `cwd` undefined in every
+      # /tools/exec response, and `timedelta` used in edge_service without
+      # being imported.
+      - name: Lint (errors only)
+        run: |
+          . .venv/bin/activate
+          ruff check --select=E9,F63,F7,F82 --output-format=concise .
+
+      # Every module must import. This is what catches a dependency that the
+      # code uses but requirements.txt never declared — psutil and
+      # email-validator were both missing, so a fresh install could not start
+      # the app at all.
+      - name: Import every module
+        run: |
+          . .venv/bin/activate
+          python -m compileall -q mc2
+          python - <<'PY'
+          import importlib, pkgutil, sys, mc2
+          bad = []
+          for m in pkgutil.walk_packages(mc2.__path__, "mc2."):
+              try:
+                  importlib.import_module(m.name)
+              except Exception as e:
+                  bad.append(f"{m.name}: {type(e).__name__}: {e}")
+          for b in bad:
+              print(f"::error::{b}")
+          print(f"{len(bad)} modules failed to import")
+          sys.exit(1 if bad else 0)
+          PY
+
+      # REPORTING ONLY — the suite does not pass yet.
+      #
+      # As of adding this: 101 pass, 47 fail, and tests/test_services.py cannot
+      # even be collected because it imports four private helpers
+      # (_compute_rpi, _estimate_paywall_hits, _estimate_upgrade_signals,
+      # _next_plan) that no longer exist — monetization_service was rewritten
+      # around four public async functions and the test was left behind.
+      # Blocking on that would make the gate meaningless; hiding it would let
+      # it rot further. So it runs, and the result is in the summary of every
+      # run. Make this blocking once the suite is green.
+      - name: Tests (reporting only)
+        id: tests
+        continue-on-error: true
+        run: |
+          . .venv/bin/activate
+          python -m pytest --no-cov -q 2>&1 | tail -40 | tee pytest.txt
+
+      - name: Style debt (reporting only)
+        continue-on-error: true
+        run: |
+          . .venv/bin/activate
+          ruff check --statistics . 2>&1 | tail -20 | tee ruff.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## mc2-backend'
+            echo
+            echo "Tests: **${{ steps.tests.outcome }}** (reporting only — suite is not green yet)"
+            echo
+            echo '```'; tail -20 pytest.txt 2>/dev/null || echo '(no output)'; echo '```'
+            echo
+            echo '<details><summary>Style debt</summary>'
+            echo; echo '```'; tail -20 ruff.txt 2>/dev/null; echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
