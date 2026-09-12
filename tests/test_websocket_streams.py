@@ -251,9 +251,9 @@ class TestEventDispatcher:
 class TestWebSocketEndpoint:
     @pytest.mark.asyncio
     async def test_ws_rejects_missing_token(self, app):
-        from httpx_ws import aconnect_ws
-        # Test with async client WebSocket support
-        # We verify via HTTP status that the WS endpoint exists
+        # Verifies via HTTP that the WS stats endpoint exists. (It used to
+        # import httpx_ws, which is not a dependency of this project and is not
+        # used by the test.)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.get("/ws/stats")
             assert resp.status_code == 200

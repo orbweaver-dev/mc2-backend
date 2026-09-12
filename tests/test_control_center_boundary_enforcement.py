@@ -56,160 +56,118 @@ def _make_cluster(**kwargs) -> dict:
 # ===========================================================================
 
 class TestLicenseServiceBoundary:
+    """The license boundary, as it stands today.
+
+    This class used to assert the opposite: that every license field came from
+    frothiq-core and that revoke/restore/force-sync were proxied to it. That
+    was reversed deliberately, and license_service.py says why in its own
+    docstring — core's registry holds PLAN TEMPLATES, not individual site
+    registrations, so it cannot answer "is this tenant's licence live". License
+    state is now derived from the Control Center's own edge_tenants and
+    edge_nodes tables and annotated `source: edge_db`.
+
+    Nine tests here asserted the old direction and failed against the new
+    service. Deleting them would have removed the guard entirely; they are
+    rewritten to hold the CURRENT line instead, so the boundary is still
+    enforced — just the boundary that exists.
+    """
+
+    @staticmethod
+    def _session_factory(tenants=(), nodes=()):
+        """A session factory whose two queries return the given rows.
+
+        get_all_license_states issues exactly two selects — tenants, then
+        nodes — so returning them in order is enough to exercise the whole
+        derivation without a database.
+        """
+        results = [list(tenants), list(nodes)]
+
+        class _Result:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def scalars(self):
+                return self
+
+            def all(self):
+                return self._rows
+
+        class _Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def execute(self, *_a, **_k):
+                return _Result(results.pop(0) if results else [])
+
+        return lambda: _Session()
 
     @pytest.mark.asyncio
-    async def test_get_all_license_states_passes_core_status_through(self):
-        """license_service must not derive status locally — uses core's license_status field."""
-        from mc2.services.license_service import get_all_license_states
-
-        core_response = {
-            "tenants": [
-                _make_core_tenant(license_status="suspended"),
-                _make_core_tenant(tenant_id="t-002", license_status="active"),
-            ]
-        }
-        with patch(
-            "mc2.services.license_service.core_client"
-        ) as mock:
-            mock.get = AsyncMock(return_value=core_response)
-            result = await get_all_license_states()
-
-        statuses = [t["status"] for t in result["tenants"]]
-        assert "suspended" in statuses
-        assert "active" in statuses
-
-    @pytest.mark.asyncio
-    async def test_get_all_license_states_no_local_status_derivation(self):
-        """Status must not be derived from 'suspended' boolean field locally."""
+    async def test_license_state_is_annotated_as_coming_from_the_edge_db(self):
+        """The source annotation is the contract: callers must be able to tell."""
         from mc2.services import license_service
 
-        # Verify _derive_license_status no longer exists (was local business logic)
-        assert not hasattr(license_service, "_derive_license_status"), (
-            "license_service must not contain _derive_license_status — "
-            "status derivation belongs in frothiq-core"
+        with patch.object(license_service, "get_session_factory",
+                          return_value=self._session_factory()):
+            result = await license_service.get_all_license_states()
+
+        assert result["source"] == "edge_db", (
+            "license state is derived from edge_tenants/edge_nodes; the annotation "
+            "is how a caller knows it did not come from frothiq-core"
         )
 
     @pytest.mark.asyncio
-    async def test_get_all_license_states_no_local_sync_health_check(self):
-        """_is_sync_healthy must not exist in license_service."""
+    async def test_sync_health_is_annotated_as_coming_from_the_edge_db(self):
         from mc2.services import license_service
-        assert not hasattr(license_service, "_is_sync_healthy"), (
-            "license_service must not contain _is_sync_healthy — "
-            "sync health evaluation belongs in frothiq-core"
+
+        with patch.object(license_service, "get_session_factory",
+                          return_value=self._session_factory()):
+            result = await license_service.get_sync_health()
+
+        assert result["source"] == "edge_db"
+        assert result["total"] == 0
+        assert result["health_pct"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_license_state_does_not_call_frothiq_core(self):
+        """The point of the reversal: no round trip to core for license state.
+
+        Asserted against the shared singleton, because a service that wanted to
+        call core would import the object rather than the module attribute.
+        """
+        from mc2.services import license_service
+        from mc2.services.core_client import core_client
+
+        with patch.object(core_client, "get", new=AsyncMock(return_value={})) as core_get, \
+             patch.object(core_client, "post", new=AsyncMock(return_value={})) as core_post, \
+             patch.object(license_service, "get_session_factory",
+                          return_value=self._session_factory()):
+            await license_service.get_all_license_states()
+
+        core_get.assert_not_called()
+        core_post.assert_not_called()
+
+    def test_license_service_holds_no_reference_to_core_client(self):
+        """A module-level import would be the first step back to the old shape."""
+        from mc2.services import license_service
+
+        assert not hasattr(license_service, "core_client"), (
+            "license_service must not hold a core_client reference — license state "
+            "comes from the edge tables (see the module docstring)"
         )
-
-    @pytest.mark.asyncio
-    async def test_get_all_license_states_uses_core_sync_healthy(self):
-        """sync_healthy field must come from core, not be computed locally."""
-        from mc2.services.license_service import get_all_license_states
-
-        with patch("mc2.services.license_service.core_client") as mock:
-            mock.get = AsyncMock(return_value={
-                "tenants": [_make_core_tenant(sync_healthy=False)]
-            })
-            result = await get_all_license_states()
-
-        assert result["tenants"][0]["sync_healthy"] is False
-
-    @pytest.mark.asyncio
-    async def test_get_all_license_states_source_annotation(self):
-        """Response must be annotated with source: frothiq-core."""
-        from mc2.services.license_service import get_all_license_states
-
-        with patch("mc2.services.license_service.core_client") as mock:
-            mock.get = AsyncMock(return_value={"tenants": []})
-            result = await get_all_license_states()
-
-        assert result.get("source") == "frothiq-core"
-
-    @pytest.mark.asyncio
-    async def test_revoke_license_calls_core_not_local(self):
-        """License revocation must POST to frothiq-core, never mutate state locally."""
-        from mc2.services.license_service import revoke_license
-
-        with patch("mc2.services.license_service.core_client") as mock:
-            mock.post = AsyncMock(return_value={"revoked": True})
-            result = await revoke_license("t-001", "test reason", "admin@test.com")
-
-        mock.post.assert_called_once()
-        call_args = mock.post.call_args
-        assert "revoke" in call_args[0][0]
-        assert result["success"] is True
-
-    @pytest.mark.asyncio
-    async def test_restore_license_calls_core(self):
-        from mc2.services.license_service import restore_license
-
-        with patch("mc2.services.license_service.core_client") as mock:
-            mock.post = AsyncMock(return_value={"restored": True})
-            result = await restore_license("t-001", "admin@test.com")
-
-        mock.post.assert_called_once()
-        assert result["success"] is True
-
-    @pytest.mark.asyncio
-    async def test_force_sync_delegates_to_core(self):
-        from mc2.services.license_service import force_sync
-
-        with patch("mc2.services.license_service.core_client") as mock:
-            mock.post = AsyncMock(return_value={"synced": True})
-            await force_sync("t-001")
-
-        mock.post.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_get_sync_health_prefers_core_endpoint(self):
-        """Sync health check should prefer core's /sync-health endpoint."""
-        from mc2.services.license_service import get_sync_health
-
-        with patch("mc2.services.license_service.core_client") as mock:
-            mock.get = AsyncMock(return_value={
-                "total": 10, "sync_healthy": 9, "sync_degraded": 1, "health_pct": 90.0
-            })
-            result = await get_sync_health()
-
-        assert result["sync_healthy"] == 9
-        assert result["health_pct"] == 90.0
-
-    @pytest.mark.asyncio
-    async def test_get_all_license_states_core_error_returns_failure(self):
-        from mc2.services.license_service import get_all_license_states
-        from mc2.services.core_client import CoreClientError
-
-        with patch("mc2.services.license_service.core_client") as mock:
-            mock.get = AsyncMock(side_effect=CoreClientError(503, "core down"))
-            result = await get_all_license_states()
-
-        assert result["success"] is False
-        assert "error" in result
-
-    @pytest.mark.asyncio
-    async def test_license_counts_derive_from_core_status_not_booleans(self):
-        """Status counts must use core's license_status field, not local boolean flags."""
-        from mc2.services.license_service import get_all_license_states
-
-        tenants = [
-            _make_core_tenant(license_status="active"),
-            _make_core_tenant(tenant_id="t-002", license_status="suspended"),
-            _make_core_tenant(tenant_id="t-003", license_status="expired"),
-            _make_core_tenant(tenant_id="t-004", license_status="trial"),
-        ]
-        with patch("mc2.services.license_service.core_client") as mock:
-            mock.get = AsyncMock(return_value={"tenants": tenants})
-            result = await get_all_license_states()
-
-        assert result["suspended"] == 1
-        assert result["expired"] == 1
-        assert result["trial"] == 1
 
     def test_license_service_module_has_no_business_logic_functions(self):
         """Ensure forbidden local computation functions don't exist."""
         from mc2.services import license_service
-        forbidden = ["_derive_license_status", "_is_sync_healthy", "_compute_health_pct"]
+        forbidden = ["_derive_license_status", "_compute_health_pct"]
         for fn in forbidden:
             assert not hasattr(license_service, fn), (
-                f"license_service.{fn} is forbidden — business logic must live in frothiq-core"
+                f"license_service.{fn} is forbidden — that shape belonged to the "
+                "proxy-everything design"
             )
+
 
 
 # ===========================================================================
@@ -500,11 +458,11 @@ class TestCommandProxy:
             assert route_cmd in _CORE_COMMAND_MAP
 
     @pytest.mark.asyncio
-    async def test_dispatch_command_requires_auth(self, app_client):
+    async def test_dispatch_command_requires_auth(self, client):
         """Unauthenticated command dispatch must return 401/403."""
         from httpx import AsyncClient
         # Command endpoint rejects missing auth at dependency injection level
-        resp = await app_client.post("/api/v1/cc/commands", json={"command": "run_simulation"})
+        resp = await client.post("/api/v1/cc/commands", json={"command": "run_simulation"})
         assert resp.status_code in (401, 403, 422)
 
 
@@ -512,73 +470,82 @@ class TestCommandProxy:
 # 5. API layer type tests (16 tests)
 # ===========================================================================
 
+# ---------------------------------------------------------------------------
+# The TypeScript half of the contract
+# ---------------------------------------------------------------------------
+#
+# These assertions read the UI repo's source. It is a SEPARATE repository, so
+# it is only there when someone has both checked out side by side — never in
+# this repo's CI. They therefore skip rather than fail when it is absent; a
+# test that cannot see what it asserts about has found nothing.
+#
+# The directory was also renamed: frothiq-control-center-ui -> mc2-ui. One
+# test hard-asserted the old name and so failed for everyone, while its three
+# neighbours guarded with `if os.path.exists` and silently passed. Both names
+# are tried here so a developer with either layout gets the real check.
+
+def _ui_lib(*parts: str) -> str | None:
+    """Absolute path inside the UI repo's lib/, or None if it is not checked out."""
+    import os
+    here = os.path.dirname(__file__)
+    for repo in ("mc2-ui", "frothiq-control-center-ui"):
+        candidate = os.path.join(here, "..", "..", repo, "lib", *parts)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+_UI_ABSENT = _ui_lib("command-client.ts") is None
+_needs_ui = pytest.mark.skipif(_UI_ABSENT, reason="UI repo (mc2-ui) is not checked out beside this one")
+
+
 class TestAPILayerTypes:
 
+    @_needs_ui
     def test_core_decision_response_type_exists_in_api_module(self):
         """CoreDecisionResponse must be exported from lib/api.ts (TypeScript side)."""
-        # Verify the TS file contains the interface definition
-        import os
-        api_ts_path = os.path.join(
-            os.path.dirname(__file__),
-            "..", "..", "frothiq-control-center-ui", "lib", "api.ts"
-        )
-        if os.path.exists(api_ts_path):
+        api_ts_path = _ui_lib("api.ts")
+        if api_ts_path:
             content = open(api_ts_path).read()
             assert "CoreDecisionResponse" in content, \
                 "CoreDecisionResponse interface missing from lib/api.ts"
             assert 'source: "frothiq-core"' in content, \
                 "CoreDecisionResponse must have source: \"frothiq-core\" discriminant"
 
+    @_needs_ui
     def test_command_client_exists(self):
-        import os
-        cc_path = os.path.join(
-            os.path.dirname(__file__),
-            "..", "..", "frothiq-control-center-ui", "lib", "command-client.ts"
-        )
-        assert os.path.exists(cc_path), "lib/command-client.ts must exist"
+        assert _ui_lib("command-client.ts"), "lib/command-client.ts must exist in the UI repo"
 
+    @_needs_ui
     def test_command_client_has_send_command_to_core(self):
-        import os
-        cc_path = os.path.join(
-            os.path.dirname(__file__),
-            "..", "..", "frothiq-control-center-ui", "lib", "command-client.ts"
-        )
-        if os.path.exists(cc_path):
+        cc_path = _ui_lib("command-client.ts")
+        if cc_path:
             content = open(cc_path).read()
             assert "sendCommandToCore" in content
             assert "sendCommandToGateway" in content
             assert "CommandReceipt" in content
 
+    @_needs_ui
     def test_command_client_all_commands_are_async_receipts(self):
-        import os
-        cc_path = os.path.join(
-            os.path.dirname(__file__),
-            "..", "..", "frothiq-control-center-ui", "lib", "command-client.ts"
-        )
-        if os.path.exists(cc_path):
+        cc_path = _ui_lib("command-client.ts")
+        if cc_path:
             content = open(cc_path).read()
             assert "Promise<CommandReceipt>" in content
             # Commands must return receipts, never void
             assert "Promise<void>" not in content
 
+    @_needs_ui
     def test_assert_core_source_function_exists(self):
-        import os
-        api_ts_path = os.path.join(
-            os.path.dirname(__file__),
-            "..", "..", "frothiq-control-center-ui", "lib", "api.ts"
-        )
-        if os.path.exists(api_ts_path):
+        api_ts_path = _ui_lib("api.ts")
+        if api_ts_path:
             content = open(api_ts_path).read()
             assert "assertCoreSource" in content
 
+    @_needs_ui
     def test_no_local_risk_computation_in_api_ts(self):
         """lib/api.ts must contain no business logic functions."""
-        import os
-        api_ts_path = os.path.join(
-            os.path.dirname(__file__),
-            "..", "..", "frothiq-control-center-ui", "lib", "api.ts"
-        )
-        if os.path.exists(api_ts_path):
+        api_ts_path = _ui_lib("api.ts")
+        if api_ts_path:
             content = open(api_ts_path).read()
             forbidden_patterns = [
                 "riskScore",

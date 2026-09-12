@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from mc2.services.core_client import CoreClientError
+
 
 class TestDashboardAPI:
     @pytest.mark.asyncio
@@ -85,7 +87,17 @@ class TestDefenseMeshAPI:
 
     @pytest.mark.asyncio
     async def test_propagation_graph_returns_nodes_edges(self, client, read_only_headers, mock_core_client, sample_cluster):
-        mock_core_client.get.return_value = {"clusters": [sample_cluster]}
+        # The service PREFERS core's dedicated propagation-graph endpoint and
+        # only builds nodes/edges from the cluster list as a fallback. A mock
+        # that answers every URL with the cluster payload makes the preferred
+        # call succeed, so that payload is returned verbatim and there is no
+        # graph in it.
+        def _by_url(url, *a, **k):
+            if url == "/api/v2/defense/propagation-graph":
+                raise CoreClientError(404, "no dedicated endpoint")
+            return {"clusters": [sample_cluster]}
+
+        mock_core_client.get.side_effect = _by_url
         resp = await client.get("/api/v1/cc/defense/propagation", headers=read_only_headers)
         assert resp.status_code == 200
         data = resp.json()
@@ -223,15 +235,27 @@ class TestLicenseAPI:
         assert resp.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_license_overview_multi_tenant(self, client, read_only_headers, mock_core_client, sample_tenant):
-        mock_core_client.get.return_value = {
-            "tenants": [sample_tenant, {**sample_tenant, "tenant_id": "tenant-002", "plan": "free"}],
-            "total": 2,
-        }
+    async def test_license_overview_multi_tenant(self, client, read_only_headers):
+        """Seeded in the edge tables, because that is where the overview reads.
+
+        This used to seed frothiq-core through mock_core_client and assert the
+        count came back. License state moved to the Control Center's own
+        tables, so the core payload was ignored and the answer was always 0.
+        """
+        from mc2.integrations.database import get_session_factory
+        from mc2.models.edge import EdgeTenant
+
+        factory = get_session_factory()
+        async with factory() as session:
+            session.add(EdgeTenant(domain="a.example.com", tenant_id="tenant-001", plan="pro"))
+            session.add(EdgeTenant(domain="b.example.com", tenant_id="tenant-002", plan="free"))
+            await session.commit()
+
         resp = await client.get("/api/v1/cc/license/overview", headers=read_only_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert data["total"] == 2
+        assert data["source"] == "edge_db"
 
 
 class TestEnvelopeAPI:
@@ -332,13 +356,20 @@ class TestMonetizationAPI:
 
     @pytest.mark.asyncio
     async def test_rpi_computed(self, client, billing_admin_headers, mock_core_client, sample_tenant):
-        mock_core_client.get.return_value = {
-            "tenants": [
-                {**sample_tenant, "plan": "free", "tenant_id": "t1"},
-                {**sample_tenant, "plan": "pro", "tenant_id": "t2"},
-                {**sample_tenant, "plan": "enterprise", "tenant_id": "t3"},
-            ]
-        }
+        # revenue_pressure_index is assembled by the FALLBACK path, so core's
+        # dedicated overview endpoint has to be absent for it to appear.
+        def _by_url(url, *a, **k):
+            if url == "/api/v2/intelligence/monetization/overview":
+                raise CoreClientError(404, "no dedicated endpoint")
+            return {
+                "tenants": [
+                    {**sample_tenant, "plan": "free", "tenant_id": "t1"},
+                    {**sample_tenant, "plan": "pro", "tenant_id": "t2"},
+                    {**sample_tenant, "plan": "enterprise", "tenant_id": "t3"},
+                ]
+            }
+
+        mock_core_client.get.side_effect = _by_url
         resp = await client.get("/api/v1/cc/monetization/overview", headers=billing_admin_headers)
         data = resp.json()
         assert "revenue_pressure_index" in data

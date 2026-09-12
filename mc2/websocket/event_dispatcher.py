@@ -67,6 +67,14 @@ async def start_event_dispatcher(redis_pubsub_client) -> None:
 
 async def _handle_message(message: dict[str, Any]) -> None:
     """Process an incoming Redis pub/sub message and dispatch to WebSocket clients."""
+    # Redis reports subscribe/unsubscribe confirmations on the same stream as
+    # real traffic, with the subscription COUNT in `data` rather than a payload.
+    # Without this guard each confirmation was decoded as an event and
+    # broadcast to every connected client — a spurious event on the wire each
+    # time the dispatcher (re)subscribed.
+    if message.get("type") not in ("message", "pmessage"):
+        return
+
     channel = message.get("channel", b"").decode("utf-8")
     data_raw = message.get("data", b"")
 

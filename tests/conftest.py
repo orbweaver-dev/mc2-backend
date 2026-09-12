@@ -34,18 +34,69 @@ def event_loop():
 
 
 # ---------------------------------------------------------------------------
+# Database schema
+# ---------------------------------------------------------------------------
+
+@pytest_asyncio.fixture(autouse=True)
+async def _database_schema():
+    """Create the tables in the test database before each test.
+
+    The `app` fixture wires a MOCK session factory into DBSessionMiddleware,
+    but the service layer does not use it: license_service and the other
+    edge-table services call get_session_factory() from mc2.integrations
+    directly, which builds a real engine against CC_DATABASE_URL. With no
+    schema behind it every one of those endpoints failed with
+    "no such table: edge_tenants" — which read like an API bug and was really
+    an empty database.
+
+    create_all is idempotent, so running per test is cheap and keeps tests from
+    inheriting rows another test wrote.
+    """
+    import os
+
+    os.environ.setdefault("CC_SECRET_KEY", "test-secret-key-minimum-32-chars-long-yes")
+    os.environ.setdefault("CC_DATABASE_URL", "sqlite+aiosqlite:///./test.db")
+
+    from mc2.integrations.database import get_engine
+    from mc2.models.user import Base
+    import mc2.integrations.database  # noqa: F401  — registers every model on Base
+
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+
+
+# ---------------------------------------------------------------------------
 # Mock frothiq-core client
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def mock_core_client():
-    """Mock CoreClient so tests don't need a live frothiq-core."""
-    with patch("mc2.services.core_client.core_client") as mock:
-        mock.get = AsyncMock(return_value={})
-        mock.post = AsyncMock(return_value={})
-        mock.health_check = AsyncMock(return_value={"status": "online", "version": "0.6.0"})
-        mock.is_healthy = MagicMock(return_value=True)
-        yield mock
+    """Mock CoreClient so tests don't need a live frothiq-core.
+
+    Patches the METHODS of the shared singleton rather than rebinding the name
+    in mc2.services.core_client.
+
+    Every service does `from .core_client import core_client` at import time,
+    which copies the object into its own module namespace. Replacing the
+    attribute on the core_client module therefore reached none of them: they
+    kept calling the real client, which raises "CoreClient not started"
+    because nothing ran its startup() outside the app lifespan. Patching the
+    object itself reaches every holder of the reference — the module-level
+    importers and the ones that import it inside a function alike.
+    """
+    # NOT `from mc2.services import core_client` — mc2/services/__init__.py
+    # re-exports the singleton under that name, so the package attribute is the
+    # INSTANCE and shadows the submodule of the same name.
+    from mc2.services.core_client import core_client as real
+    with patch.object(real, "get", new=AsyncMock(return_value={})), \
+         patch.object(real, "post", new=AsyncMock(return_value={})), \
+         patch.object(real, "health_check",
+                      new=AsyncMock(return_value={"status": "online", "version": "0.6.0"})), \
+         patch.object(real, "is_healthy", new=MagicMock(return_value=True)):
+        yield real
 
 
 # ---------------------------------------------------------------------------

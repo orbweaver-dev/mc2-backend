@@ -27,7 +27,7 @@ jobs:
           . .venv/bin/activate
           pip install -q --upgrade pip
           pip install -q -r requirements.txt
-          pip install -q ruff pytest pytest-asyncio pytest-cov
+          pip install -q ruff pytest pytest-asyncio pytest-cov aiosqlite
 
       # BLOCKING — things that are true today and must stay true.
       #
@@ -65,22 +65,18 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
-      # REPORTING ONLY — the suite does not pass yet.
+      # BLOCKING. The suite was 101 pass / 47 fail / 1 uncollectable module
+      # when CI was added, and reported rather than enforced until it was
+      # fixed. It is green now — 170 passed, 6 skipped — so it gates.
       #
-      # As of adding this: 101 pass, 47 fail, and tests/test_services.py cannot
-      # even be collected because it imports four private helpers
-      # (_compute_rpi, _estimate_paywall_hits, _estimate_upgrade_signals,
-      # _next_plan) that no longer exist — monetization_service was rewritten
-      # around four public async functions and the test was left behind.
-      # Blocking on that would make the gate meaningless; hiding it would let
-      # it rot further. So it runs, and the result is in the summary of every
-      # run. Make this blocking once the suite is green.
-      - name: Tests (reporting only)
+      # The 6 skips are the assertions that read the UI repo's TypeScript:
+      # mc2-ui is a separate repository and is never beside this one in CI, so
+      # they skip rather than pass vacuously.
+      - name: Tests
         id: tests
-        continue-on-error: true
         run: |
           . .venv/bin/activate
-          set -o pipefail   # else the step's outcome is tail's, and always success
+          set -o pipefail
           python -m pytest --no-cov -q 2>&1 | tail -40 | tee pytest.txt
 
       - name: Style debt (reporting only)
@@ -96,7 +92,7 @@ jobs:
           {
             echo '## mc2-backend'
             echo
-            echo "Tests: **${{ steps.tests.outcome }}** (reporting only — suite is not green yet)"
+            echo "Tests: **${{ steps.tests.outcome }}**"
             echo
             echo '```'; tail -20 pytest.txt 2>/dev/null || echo '(no output)'; echo '```'
             echo

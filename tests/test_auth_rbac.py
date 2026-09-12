@@ -250,6 +250,26 @@ class TestRBACEndpoints:
         result_mock.scalar_one_or_none.return_value = None
         mock_db.execute.return_value = result_mock
 
+        # The handler relies on db.refresh() to populate what the database
+        # fills in — id, is_active, totp_enabled, created_at. On an AsyncMock
+        # refresh does nothing, so those stayed None and UserResponse refused
+        # to serialise the reply. Give the mock the one behaviour the handler
+        # actually depends on.
+        import uuid as _uuid
+        from datetime import UTC as _UTC, datetime as _dt
+
+        async def _refresh(obj, *_a, **_k):
+            if getattr(obj, "id", None) is None:
+                obj.id = str(_uuid.uuid4())
+            if getattr(obj, "is_active", None) is None:
+                obj.is_active = True
+            if getattr(obj, "totp_enabled", None) is None:
+                obj.totp_enabled = False
+            if getattr(obj, "created_at", None) is None:
+                obj.created_at = _dt.now(_UTC)
+
+        mock_db.refresh = AsyncMock(side_effect=_refresh)
+
         resp = await client.post(
             "/api/v1/cc/auth/users",
             headers=super_admin_headers,
