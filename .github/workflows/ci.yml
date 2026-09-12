@@ -80,12 +80,14 @@ jobs:
         continue-on-error: true
         run: |
           . .venv/bin/activate
+          set -o pipefail   # else the step's outcome is tail's, and always success
           python -m pytest --no-cov -q 2>&1 | tail -40 | tee pytest.txt
 
       - name: Style debt (reporting only)
         continue-on-error: true
         run: |
           . .venv/bin/activate
+          set -o pipefail
           ruff check --statistics . 2>&1 | tail -20 | tee ruff.txt
 
       - name: Summary
